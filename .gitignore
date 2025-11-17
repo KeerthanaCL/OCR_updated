@@ -1,0 +1,21 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Environment & credentials
+.env
+
+# Database
+*.db
+
+# Upload folders
+backend/uploads/
+
+# Temporary output
+*.png
+*.jpg
+*.jpeg
+*.pdf
+
+# Virtual environments
+venv/
