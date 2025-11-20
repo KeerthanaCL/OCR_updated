@@ -19,6 +19,13 @@ class DocumentStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
 
+class JobStatusEnum(str, Enum):
+    """Job processing status for orchestrator"""
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
 class UploadResponse(BaseModel):
     """Response model for document upload"""
     document_id: str
@@ -76,39 +83,81 @@ class JobStatus(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-class InsuranceClaimData(BaseModel):
-    """Structured insurance claim data"""
-    # Personal Information
+class JobStatusResponse(BaseModel):
+    """Response model for job status queries"""
+    job_id: str
+    document_id: str
+    status: str
+    created_at: str
+    updated_at: str
+    results: Dict[str, Any] = {}
+    error: Optional[str] = None
+    metadata: Dict[str, Any] = {}
+
+class SegmentExtractionRequest(BaseModel):
+    """Request for extracting a specific segment type"""
+    document_id: Optional[str] = None  # Extract from document
+    text: Optional[str] = None  # Or provide text directly
+    extract_appeals_first: bool = True  # First extract appeals section
+
+class ReferenceItem(BaseModel):
+    """Individual reference found in document"""
+    reference_type: str  # "case_number", "phone", "address", "provider", etc.
+    content: str
+    location: Optional[str] = None  # Where in document
+    verified: bool = False
+
+class ReferencesExtractionResponse(BaseModel):
+    """Response from references extraction"""
+    success: bool
+    references: List[ReferenceItem]
+    summary: str  # OpenAI's summary of references
+    confidence: float
+    raw_text_analyzed: str  # What text was sent to OpenAI
+    processing_time: float
+
+class MedicalCondition(BaseModel):
+    """Medical condition mentioned"""
+    condition: str
+    diagnosis_date: Optional[str] = None
+    severity: Optional[str] = None
+    treatment: Optional[str] = None
+
+class Medication(BaseModel):
+    """Medication mentioned"""
+    name: str
+    dosage: Optional[str] = None
+    frequency: Optional[str] = None
+    purpose: Optional[str] = None
+
+class MedicalContextResponse(BaseModel):
+    """Response from medical context extraction"""
+    success: bool
     patient_name: Optional[str] = None
-    policy_number: Optional[str] = None
-    claim_number: Optional[str] = None
-    member_id: Optional[str] = None
-    
-    # Contact Information
-    address: Optional[str] = None
-    phone: Optional[str] = None
-    email: Optional[str] = None
-    
-    # Medical Information
-    diagnosis: Optional[str] = None
-    diagnosis_codes: Optional[List[str]] = []
-    procedure_codes: Optional[List[str]] = []
-    date_of_service: Optional[str] = None
-    
-    # Financial Information
-    total_amount: Optional[float] = None
-    claimed_amount: Optional[float] = None
-    deductible: Optional[float] = None
-    copay: Optional[float] = None
-    
-    # Provider Information
-    provider_name: Optional[str] = None
-    provider_npi: Optional[str] = None
-    
-    # Bill Items
-    bill_items: Optional[List[Dict[str, Any]]] = []
-    
-    # Metadata
-    has_signature: bool = False
-    orientation_corrected: bool = False
-    tables_found: int = 0
+    conditions: List[MedicalCondition]
+    medications: List[Medication]
+    medical_history: str  # OpenAI's summary
+    medical_necessity_argument: Optional[str] = None
+    providers_mentioned: List[str] = []
+    confidence: float
+    raw_text_analyzed: str
+    processing_time: float
+
+class LegalClaim(BaseModel):
+    """Legal claim or right mentioned"""
+    claim_type: str  # "appeal_right", "erisa", "ppaca", etc.
+    description: str
+    relevant_statute: Optional[str] = None
+    deadline: Optional[str] = None
+
+class LegalContextResponse(BaseModel):
+    """Response from legal context extraction"""
+    success: bool
+    legal_claims: List[LegalClaim]
+    appeal_type: Optional[str] = None  # "standard", "expedited", etc.
+    legal_summary: str  # OpenAI's summary
+    statutes_cited: List[str] = []
+    deadlines_mentioned: List[str] = []
+    confidence: float
+    raw_text_analyzed: str
+    processing_time: float

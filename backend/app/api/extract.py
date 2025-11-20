@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 from sqlalchemy.orm import Session
-from app.models import ExtractionRequest, ExtractionResult, JobStatus, OCRMethod
+from app.models import ExtractionRequest, ExtractionResult, JobStatusResponse, OCRMethod
 from app.agents.orchestrator import AgentOrchestrator
 from app.services.storage import StorageService
 from app.database import get_db, Extraction
@@ -40,7 +40,7 @@ async def extract_text(
             apply_parsing=False  # Only extraction
         )
         
-        extraction_data = results['extraction']
+        extraction_data = results
 
         # FIX: Handle both string and OCRMethod enum
         method_used = extraction_data['method_used']
@@ -66,7 +66,7 @@ async def extract_text(
             method_used=method_used_str,
             pages=extraction_data['pages'],
             processing_time=extraction_data['processing_time'],
-            extraction_metadata=extraction_data['metadata']
+            extraction_metadata=extraction_data.get('metadata', {})
         )
         db.add(db_extraction)
         db.commit()
@@ -89,7 +89,7 @@ async def extract_text(
         logger.error(f"Extraction failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/extract/status/{job_id}", response_model=JobStatus)
+@router.get("/extract/status/{job_id}", response_model=JobStatusResponse)
 async def get_extraction_status(job_id: str):
     """Get status of an extraction job"""
     status = orchestrator.get_job_status(job_id)

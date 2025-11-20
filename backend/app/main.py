@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 from app.config import get_settings
-from app.api import upload, extract, parse
+from app.api import upload, extract, segment_extraction
 
 # Configure logging
 logging.basicConfig(
@@ -32,7 +32,7 @@ app.add_middleware(
 # Include routers
 app.include_router(upload.router)
 app.include_router(extract.router)
-app.include_router(parse.router)
+app.include_router(segment_extraction.router)
 
 @app.get("/")
 async def root():
