@@ -19,3 +19,5 @@ backend/uploads/
 
 # Virtual environments
 venv/
+
+backend/app/config.py
