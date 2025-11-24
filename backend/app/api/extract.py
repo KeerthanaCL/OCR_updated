@@ -32,7 +32,7 @@ async def extract_text(
         job_id = orchestrator.create_job(request.document_id)
         
         # Execute extraction
-        results = orchestrator.execute_full_pipeline(
+        results = orchestrator.execute_extraction_pipeline(
             job_id=job_id,
             file_path=file_path,
             use_preprocessing=request.use_preprocessing,
