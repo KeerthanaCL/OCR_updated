@@ -102,18 +102,24 @@ class SegmentExtractionRequest(BaseModel):
 
 class ReferenceItem(BaseModel):
     """Individual reference found in document"""
-    reference_type: str  # "case_number", "phone", "address", "provider", etc.
+    reference_type: str  # "research_paper", "online_resource", "patient_detail", "contact_info", etc.
     content: str
-    location: Optional[str] = None  # Where in document
+    location: Optional[str] = None
     verified: bool = False
+    priority: str = "low"  # "high", "medium", "low"
+    validation_notes: Optional[str] = None  # Why it's verified/unverified
 
 class ReferencesExtractionResponse(BaseModel):
     """Response from references extraction"""
     success: bool
-    references: List[ReferenceItem]
-    summary: str  # OpenAI's summary of references
+    research_papers: List[ReferenceItem] = []  # High priority
+    online_resources: List[ReferenceItem] = []  # High priority
+    patient_details: List[ReferenceItem] = []  # Medium priority
+    other_references: List[ReferenceItem] = []  # Low priority
+    summary: str
     confidence: float
-    raw_text_analyzed: str  # What text was sent to OpenAI
+    validation_summary: str  # Overall validation assessment
+    raw_text_analyzed: str
     processing_time: float
 
 class MedicalCondition(BaseModel):
@@ -122,6 +128,8 @@ class MedicalCondition(BaseModel):
     diagnosis_date: Optional[str] = None
     severity: Optional[str] = None
     treatment: Optional[str] = None
+    is_valid_condition: bool = True  # Validated as real medical condition
+    validation_notes: Optional[str] = None  # Medical validation feedback
 
 class Medication(BaseModel):
     """Medication mentioned"""
@@ -129,6 +137,9 @@ class Medication(BaseModel):
     dosage: Optional[str] = None
     frequency: Optional[str] = None
     purpose: Optional[str] = None
+    is_valid_medication: bool = True  # Validated as real medication
+    is_correct_dosage: bool = True  # Dosage is within normal range
+    validation_notes: Optional[str] = None  # Pharmacy validation feedback
 
 class MedicalContextResponse(BaseModel):
     """Response from medical context extraction"""
@@ -136,28 +147,35 @@ class MedicalContextResponse(BaseModel):
     patient_name: Optional[str] = None
     conditions: List[MedicalCondition]
     medications: List[Medication]
-    medical_history: str  # OpenAI's summary
+    medical_history: str
     medical_necessity_argument: Optional[str] = None
     providers_mentioned: List[str] = []
     confidence: float
+    validation_summary: str  # Overall medical validation
+    medical_accuracy_score: float  # 0-1 score for medical accuracy
     raw_text_analyzed: str
     processing_time: float
 
 class LegalClaim(BaseModel):
     """Legal claim or right mentioned"""
-    claim_type: str  # "appeal_right", "erisa", "ppaca", etc.
+    claim_type: str
     description: str
     relevant_statute: Optional[str] = None
     deadline: Optional[str] = None
+    is_valid_claim: bool = True  # Validated as legitimate legal claim
+    statute_accuracy: bool = True  # Statute citation is accurate
+    validation_notes: Optional[str] = None  # Legal validation feedback
 
 class LegalContextResponse(BaseModel):
     """Response from legal context extraction"""
     success: bool
     legal_claims: List[LegalClaim]
-    appeal_type: Optional[str] = None  # "standard", "expedited", etc.
-    legal_summary: str  # OpenAI's summary
+    appeal_type: Optional[str] = None
+    legal_summary: str
     statutes_cited: List[str] = []
     deadlines_mentioned: List[str] = []
     confidence: float
+    validation_summary: str  # Overall legal validation
+    legal_accuracy_score: float  # 0-1 score for legal accuracy
     raw_text_analyzed: str
     processing_time: float
