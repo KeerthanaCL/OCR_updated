@@ -139,34 +139,36 @@ class TrOCRService:
         Returns:
             Tuple of (combined_text, metadata)
         """
-        image = Image.open(image_path).convert("RGB")
-        extracted_texts = []
-        
-        for idx, (x, y, w, h) in enumerate(regions):
-            # Crop region
-            region = image.crop((x, y, x + w, y + h))
+        try:
+            image = Image.open(image_path).convert('RGB')
+            all_texts = []
             
-            # Process region
-            pixel_values = self.processor(
-                region, 
-                return_tensors="pt"
-            ).pixel_values.to(self.device)
-            
-            # Generate text
-            with torch.no_grad():
+            for region in regions:
+                # Crop region
+                x, y, w, h = region['x'], region['y'], region['width'], region['height']
+                region_img = image.crop((x, y, x + w, y + h))
+                
+                # Process region
+                pixel_values = self.processor(region_img, return_tensors="pt").pixel_values
+                pixel_values = pixel_values.to(self.device)
+                
+                # Generate text
                 generated_ids = self.model.generate(pixel_values)
+                text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+                
+                if text.strip():
+                    all_texts.append(text)
             
-            text = self.processor.batch_decode(
-                generated_ids, 
-                skip_special_tokens=True
-            )[0]
+            combined_text = ' '.join(all_texts)
             
-            extracted_texts.append(text)
-        
-        combined_text = "\n".join(extracted_texts)
-        metadata = {
-            'regions_processed': len(regions),
-            'model_used': self.model.config.name_or_path
-        }
-        
-        return combined_text, metadata
+            metadata = {
+                'regions_processed': len(regions),
+                'regions_with_text': len(all_texts),
+                'model': 'trocr-region-based'
+            }
+            
+            return combined_text, metadata
+            
+        except Exception as e:
+            logger.error(f"TrOCR region extraction failed: {e}")
+            raise

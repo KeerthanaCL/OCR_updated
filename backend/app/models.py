@@ -128,7 +128,7 @@ class MedicalCondition(BaseModel):
     diagnosis_date: Optional[str] = None
     severity: Optional[str] = None
     treatment: Optional[str] = None
-    is_valid_condition: bool = True  # Validated as real medical condition
+    is_valid_condition: Optional[bool] = True  # Validated as real medical condition
     validation_notes: Optional[str] = None  # Medical validation feedback
 
 class Medication(BaseModel):
@@ -137,8 +137,8 @@ class Medication(BaseModel):
     dosage: Optional[str] = None
     frequency: Optional[str] = None
     purpose: Optional[str] = None
-    is_valid_medication: bool = True  # Validated as real medication
-    is_correct_dosage: bool = True  # Dosage is within normal range
+    is_valid_medication: Optional[bool] = True  # Validated as real medication
+    is_correct_dosage: Optional[bool] = True  # Dosage is within normal range
     validation_notes: Optional[str] = None  # Pharmacy validation feedback
 
 class MedicalContextResponse(BaseModel):
@@ -162,8 +162,8 @@ class LegalClaim(BaseModel):
     description: str
     relevant_statute: Optional[str] = None
     deadline: Optional[str] = None
-    is_valid_claim: bool = True  # Validated as legitimate legal claim
-    statute_accuracy: bool = True  # Statute citation is accurate
+    is_valid_claim: Optional[bool] = True  # Validated as legitimate legal claim
+    statute_accuracy: Optional[bool] = True  # Statute citation is accurate
     validation_notes: Optional[str] = None  # Legal validation feedback
 
 class LegalContextResponse(BaseModel):
