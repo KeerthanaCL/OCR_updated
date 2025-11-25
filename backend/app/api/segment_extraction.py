@@ -6,18 +6,15 @@ from app.models import (
     MedicalContextResponse,
     LegalContextResponse
 )
-from app.services.openai_extraction_service import OpenAIExtractionService
-from app.services.appeals_service import AppealsExtractionService
+from app.agents.segment_agent import SegmentAgent
 from app.database import get_db, Extraction
 import logging
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/segments", tags=["segment-extraction"])
 
-# Global services
-openai_service = OpenAIExtractionService()
-appeals_service = AppealsExtractionService()
-
+# Global agent instance (CHANGED from services to agent)
+segment_agent = SegmentAgent()
 
 async def get_text_for_extraction(
     request: SegmentExtractionRequest,
@@ -43,11 +40,12 @@ async def get_text_for_extraction(
             detail="Either document_id or text must be provided"
         )
     
-    # Extract appeals section if requested
+    # Extract appeals section if requested (CHANGED to use agent)
     if request.extract_appeals_first:
-        appeals_text, found = appeals_service.extract_appeals_section(text)
-        if found and appeals_text:
-            return appeals_text
+        appeals_result = segment_agent.extract_appeals_section(text)
+        if appeals_result['found'] and appeals_result['appeals_text']:
+            logger.info(f"Using extracted appeals section: {len(appeals_result['appeals_text'])} chars")
+            return appeals_result['appeals_text']
     
     return text
 
@@ -63,14 +61,25 @@ async def extract_references(
     Workflow:
     1. Get text from document or directly
     2. Optionally extract appeals section first
-    3. Send entire text to OpenAI for reference extraction
+    3. Use SegmentAgent to extract references via OpenAI
     4. Return structured references
     """
     try:
         text = await get_text_for_extraction(request, db)
         
         logger.info(f"Extracting references from {len(text)} characters")
-        result = await openai_service.extract_references(text)
+        result = await segment_agent.extract_references(text)
+
+        # Handle agent response format
+        if isinstance(result, dict):
+            if not result.get('success', True):
+                raise HTTPException(
+                    status_code=500,
+                    detail=result.get('error', 'Reference extraction failed')
+                )
+            # If result has nested structure, extract it
+            if 'references' in result:
+                return result['references']
         
         return result
         
@@ -95,14 +104,25 @@ async def extract_medical_context(
     Workflow:
     1. Get text from document or directly
     2. Optionally extract appeals section first
-    3. Send entire text to OpenAI for medical extraction
+    3. Use SegmentAgent to extract medical info via OpenAI
     4. Return structured medical information
     """
     try:
         text = await get_text_for_extraction(request, db)
         
         logger.info(f"Extracting medical context from {len(text)} characters")
-        result = await openai_service.extract_medical_context(text)
+        result = await segment_agent.extract_medical_segment(text)
+        
+        # Handle agent response format
+        if isinstance(result, dict):
+            if not result.get('success', True):
+                raise HTTPException(
+                    status_code=500,
+                    detail=result.get('error', 'Medical extraction failed')
+                )
+            # If result has nested structure, extract it
+            if 'medical_data' in result:
+                return result['medical_data']
         
         return result
         
@@ -127,14 +147,25 @@ async def extract_legal_context(
     Workflow:
     1. Get text from document or directly
     2. Optionally extract appeals section first
-    3. Send entire text to OpenAI for legal extraction
+    3. Use SegmentAgent to extract legal info via OpenAI
     4. Return structured legal information
     """
     try:
         text = await get_text_for_extraction(request, db)
         
         logger.info(f"Extracting legal context from {len(text)} characters")
-        result = await openai_service.extract_legal_context(text)
+        result = await segment_agent.extract_legal_segment(text)
+        
+        # Handle agent response format
+        if isinstance(result, dict):
+            if not result.get('success', True):
+                raise HTTPException(
+                    status_code=500,
+                    detail=result.get('error', 'Legal extraction failed')
+                )
+            # If result has nested structure, extract it
+            if 'legal_data' in result:
+                return result['legal_data']
         
         return result
         
@@ -145,4 +176,35 @@ async def extract_legal_context(
         raise HTTPException(
             status_code=500,
             detail=f"Legal extraction failed: {str(e)}"
+        )
+    
+@router.post("/all")
+async def extract_all_segments(
+    request: SegmentExtractionRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Extract all segments (references, medical, legal) in one call.
+    
+    This is useful when you need all segment types at once.
+    """
+    try:
+        text = await get_text_for_extraction(request, db)
+        logger.info(f"Extracting all segments from {len(text)} characters")
+        
+        # CHANGED: Use SegmentAgent's extract_all_segments method
+        result = await segment_agent.extract_all_segments(
+            text=text,
+            extract_appeals_first=request.extract_appeals_first
+        )
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Segment extraction failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Segment extraction failed: {str(e)}"
         )

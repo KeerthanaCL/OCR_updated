@@ -13,8 +13,15 @@ logger = logging.getLogger(__name__)
 
 class ExtractionAgent:
     """
-    Intelligent agent for document text extraction.
-    Uses Tesseract first, then TrOCR if confidence is low.
+    Agent responsible for intelligent document text extraction.
+    
+    This agent:
+    - Handles OCR using multiple methods (Tesseract, EasyOCR, TrOCR)
+    - Automatically detects and corrects document orientation
+    - Converts PDF files to images for processing
+    - Uses confidence-based fallback logic for optimal accuracy
+    
+    Primary method: execute()
     """
     
     def __init__(self):
@@ -140,7 +147,7 @@ class ExtractionAgent:
         
         try:
             if force_trocr:
-                result = self._extract_with_trocr_multi(
+                return self._extract_with_trocr_multi(
                     image_paths, start_time
                 )
             elif use_easyocr:
@@ -198,8 +205,14 @@ class ExtractionAgent:
         
         if force_trocr:
             result = self._extract_with_trocr_single(image_path, start_time)
+            if orientation_info:  # ← ADD this
+                result['orientation'] = orientation_info
+            return result
         elif use_easyocr:
-            return self._extract_with_easyocr_single(image_path, start_time)
+            result = self._extract_with_easyocr_single(image_path, start_time)
+            if orientation_info:  # ← ADD this
+                result['orientation'] = orientation_info
+            return result
         
         # Try Tesseract
         text, confidence, metadata = self.tesseract.extract_text_with_confidence(
@@ -210,13 +223,19 @@ class ExtractionAgent:
         if confidence < self.tesseract.confidence_threshold:
             logger.warning(f"Low confidence ({confidence:.2f}%), trying EasyOCR")
             try:
-                return self._extract_with_easyocr_single(image_path, start_time)
+                result = self._extract_with_easyocr_single(image_path, start_time)
+                if orientation_info:  # ← ADD this
+                    result['orientation'] = orientation_info
+                return result
             except Exception as e:
                 logger.warning(f"EasyOCR failed, trying TrOCR")
-                return self._extract_with_trocr_single(image_path, start_time)
+                result = self._extract_with_trocr_single(image_path, start_time)
+                if orientation_info:  # ← ADD this
+                    result['orientation'] = orientation_info
+                return result
         
         processing_time = time.time() - start_time
-        return {
+        result = {
             'text': text,
             'confidence': confidence,
             'method_used': 'tesseract',
@@ -224,6 +243,11 @@ class ExtractionAgent:
             'processing_time': processing_time,
             'metadata': metadata
         }
+
+        if orientation_info:  # ← ADD this
+            result['orientation'] = orientation_info
+        
+        return result
     
     def _extract_with_trocr_multi(
         self,
@@ -295,7 +319,7 @@ class ExtractionAgent:
         return {
             'text': text,
             'confidence': 95.0,
-            'method_used': 'tesseract',
+            'method_used': 'trocr',
             'pages': 1,
             'processing_time': processing_time,
             'metadata': metadata
