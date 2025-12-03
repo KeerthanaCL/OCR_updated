@@ -6,7 +6,7 @@ from app.models import (
     MedicalContextResponse,
     LegalContextResponse
 )
-from app.agents.segment_agent import SegmentAgent
+from app.agents.segment_agent import LangGraphSegmentationAgent
 from app.database import get_db, Extraction
 import logging
 
@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/segments", tags=["segment-extraction"])
 
 # Global agent instance (CHANGED from services to agent)
-segment_agent = SegmentAgent()
+segment_agent = LangGraphSegmentationAgent()
 
 async def get_text_for_extraction(
     request: SegmentExtractionRequest,
@@ -68,20 +68,15 @@ async def extract_references(
         text = await get_text_for_extraction(request, db)
         
         logger.info(f"Extracting references from {len(text)} characters")
-        result = await segment_agent.extract_references(text)
-
-        # Handle agent response format
-        if isinstance(result, dict):
-            if not result.get('success', True):
-                raise HTTPException(
-                    status_code=500,
-                    detail=result.get('error', 'Reference extraction failed')
-                )
-            # If result has nested structure, extract it
-            if 'references' in result:
-                return result['references']
         
-        return result
+        # Run full segmentation with the agent
+        seg_result = await segment_agent.execute(
+            text=text,
+            document_id=request.document_id or "",
+            extract_appeals_first=False  # already handled in get_text_for_extraction
+        )
+        
+        return seg_result["references"]
         
     except HTTPException:
         raise
@@ -111,20 +106,13 @@ async def extract_medical_context(
         text = await get_text_for_extraction(request, db)
         
         logger.info(f"Extracting medical context from {len(text)} characters")
-        result = await segment_agent.extract_medical_segment(text)
-        
-        # Handle agent response format
-        if isinstance(result, dict):
-            if not result.get('success', True):
-                raise HTTPException(
-                    status_code=500,
-                    detail=result.get('error', 'Medical extraction failed')
-                )
-            # If result has nested structure, extract it
-            if 'medical_data' in result:
-                return result['medical_data']
-        
-        return result
+        seg_result = await segment_agent.execute(
+            text=text,
+            document_id=request.document_id or "",
+            extract_appeals_first=False
+        )
+
+        return seg_result["medical"]
         
     except HTTPException:
         raise
@@ -154,20 +142,13 @@ async def extract_legal_context(
         text = await get_text_for_extraction(request, db)
         
         logger.info(f"Extracting legal context from {len(text)} characters")
-        result = await segment_agent.extract_legal_segment(text)
-        
-        # Handle agent response format
-        if isinstance(result, dict):
-            if not result.get('success', True):
-                raise HTTPException(
-                    status_code=500,
-                    detail=result.get('error', 'Legal extraction failed')
-                )
-            # If result has nested structure, extract it
-            if 'legal_data' in result:
-                return result['legal_data']
-        
-        return result
+        seg_result = await segment_agent.execute(
+            text=text,
+            document_id=request.document_id or "",
+            extract_appeals_first=False
+        )
+
+        return seg_result["legal"]
         
     except HTTPException:
         raise
@@ -192,13 +173,13 @@ async def extract_all_segments(
         text = await get_text_for_extraction(request, db)
         logger.info(f"Extracting all segments from {len(text)} characters")
         
-        # CHANGED: Use SegmentAgent's extract_all_segments method
-        result = await segment_agent.extract_all_segments(
+        seg_result = await segment_agent.execute(
             text=text,
+            document_id=request.document_id or "",
             extract_appeals_first=request.extract_appeals_first
         )
-        
-        return result
+
+        return seg_result  # contains references, medical, legal, overall_success
         
     except HTTPException:
         raise
