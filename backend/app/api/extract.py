@@ -5,7 +5,7 @@ from app.models import (
     DocumentStatus,
     OCRMethod
 )
-from app.agents.orchestrator import OrchestratorAgent
+from app.agents.orchestrator import LangGraphOrchestratorAgent
 from app.services.storage import StorageService
 from app.database import get_db, Document, Extraction, AppealsExtraction, AppealsSegment
 import uuid
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["extraction"])
 
 # Global orchestrator instance
-orchestrator = OrchestratorAgent()
+orchestrator = LangGraphOrchestratorAgent()
 
 @router.post("/extract")
 async def extract_and_segment_document(
@@ -55,6 +55,7 @@ async def extract_and_segment_document(
         # Step 3: Execute complete processing pipeline via orchestrator
         result = await orchestrator.process_document(
             file_path=file_path,
+            document_id=request.document_id,
             use_preprocessing=request.use_preprocessing,
             force_trocr=request.force_trocr
         )
@@ -86,7 +87,7 @@ async def extract_and_segment_document(
             text=extraction_data['text'],
             confidence=extraction_data['confidence'],
             method_used=method_used_str,
-            pages=extraction_data['pages'],
+            pages=extraction_data.get('pages', extraction_data.get('metadata', {}).get('page_count', 1)),
             processing_time=extraction_data['processing_time'],
             extraction_metadata=extraction_data.get('metadata', {})
         )

@@ -2,256 +2,193 @@ import logging
 from typing import Dict, Any
 import time
 
-from app.agents.base_agent import BaseAgent
+from langgraph.graph import StateGraph, END
+
+from app.agents.graph_state import SegmentationState
 from app.services.appeals_service import AppealsExtractionService
 from app.services.openai_extraction_service import OpenAIExtractionService
 
 logger = logging.getLogger(__name__)
 
-class SegmentAgent(BaseAgent):
+class LangGraphSegmentationAgent:
     """
-    Intelligent agent for document segmentation and validation.
+    LangGraph-based segmentation agent with validation and retry.
     
-    Agent Capabilities:
-    - Autonomous quality assessment
-    - Retry logic with improved prompts
-    - Learning from segmentation patterns
-    - Confidence-based validation
-    
-    Goals:
-    - Extract complete, accurate segments
-    - Validate segment quality
-    - Minimize extraction errors
+    Graph Flow:
+    START → extract_appeals → extract_references → validate_references
+    → [if invalid & retries left] → extract_references
+    → extract_medical → validate_medical → [retry if needed]
+    → extract_legal → validate_legal → [retry if needed]
+    → finalize → END
     """
     
     def __init__(self):
-        super().__init__("SegmentationAgent")
-
         self.appeals_service = AppealsExtractionService()
         self.openai_service = OpenAIExtractionService()  # If using AI for extraction
+        self.graph = self._build_graph()
 
-        # Agent Goals
-        self.goals = {
-            'min_reference_count': 3,
-            'min_medical_conditions': 1,
-            'require_validation': True,
-            'max_retry_attempts': 2
-        }
+    def _build_graph(self) -> StateGraph:
+        """Build segmentation workflow graph"""
         
-        # Agent State
-        self.state['performance_metrics'] = {
-            'references': {'success_rate': 0.0, 'avg_count': 0.0},
-            'medical': {'success_rate': 0.0, 'avg_conditions': 0.0},
-            'legal': {'success_rate': 0.0, 'avg_claims': 0.0}
-        }
+        workflow = StateGraph(SegmentationState)
         
-        logger.info(f"{self.agent_name} initialized")
-
-    def assess_text_quality(self, text: str) -> Dict[str, Any]:
-        """Agent assesses text quality before segmentation"""
-        assessment = {
-            'length': len(text),
-            'has_content': len(text.strip()) > 100,
-            'word_count': len(text.split()),
-            'avg_word_length': sum(len(word) for word in text.split()) / max(len(text.split()), 1),
-            'quality': 'good' if len(text) > 500 else 'poor'
-        }
+        # Add nodes
+        workflow.add_node("extract_appeals", self._extract_appeals_node)
+        workflow.add_node("extract_references", self._extract_references_node)
+        workflow.add_node("validate_references", self._validate_references_node)
+        workflow.add_node("extract_medical", self._extract_medical_node)
+        workflow.add_node("validate_medical", self._validate_medical_node)
+        workflow.add_node("extract_legal", self._extract_legal_node)
+        workflow.add_node("validate_legal", self._validate_legal_node)
+        workflow.add_node("finalize", self._finalize_node)
         
-        logger.info(f"Text Assessment: {assessment['word_count']} words, quality={assessment['quality']}")
-        return assessment
+        # Set entry
+        workflow.set_entry_point("extract_appeals")
+        
+        # Linear flow with conditional retries
+        workflow.add_edge("extract_appeals", "extract_references")
+        workflow.add_edge("extract_references", "validate_references")
+        
+        workflow.add_conditional_edges(
+            "validate_references",
+            lambda s: "retry" if not s['references_valid'] and s['references_retry_count'] < s['max_retries'] else "continue",
+            {"retry": "extract_references", "continue": "extract_medical"}
+        )
+        
+        workflow.add_edge("extract_medical", "validate_medical")
+        
+        workflow.add_conditional_edges(
+            "validate_medical",
+            lambda s: "retry" if not s['medical_valid'] and s['medical_retry_count'] < s['max_retries'] else "continue",
+            {"retry": "extract_medical", "continue": "extract_legal"}
+        )
+        
+        workflow.add_edge("extract_legal", "validate_legal")
+        workflow.add_edge("validate_legal", "finalize")
+        workflow.add_edge("finalize", END)
+        
+        return workflow.compile()
     
-    async def extract_references(self, text: str, retry_count: int = 0) -> Dict[str, Any]:
-        """
-        Extract and validate reference segments from text.
+    def _extract_appeals_node(self, state: SegmentationState) -> SegmentationState:
+        """Node: Extract appeals section if requested"""
         
-        Args:
-            text: Extracted document text
-            
-        Returns:
-            Dictionary containing reference information
-        """
-        start_time = time.time()
-        try:
-            # Assess text quality
-            quality = self.assess_text_quality(text)
-            
-            if not quality['has_content']:
-                logger.warning("Insufficient text for reference extraction")
-                return {
-                    'success': False,
-                    'error': 'Insufficient text content',
-                    'references': []
-                }
-            
-            logger.info(f"Extracting references (attempt {retry_count + 1})...")
-            
-            # Execute extraction
-            result = await self.openai_service.extract_references(text)
-            
-            # Validate result
-            validation = self._validate_references(result)
-            
-            if not validation['is_valid'] and retry_count < self.goals['max_retry_attempts']:
-                logger.warning(f"Validation failed: {validation['reason']}, retrying...")
-                return await self.extract_references(text, retry_count + 1)
-            
-            # Record execution
-            success = validation['is_valid']
-            self.record_execution('extract_references', {
-                'reference_count': len(result.references) if hasattr(result, 'references') else 0,
-                'validation': validation,
-                'processing_time': time.time() - start_time
-            }, success)
-            
-            # Learn from execution
-            self.learn_from_execution('references', {
-                'count': len(result.references) if hasattr(result, 'references') else 0,
-                'success': success
-            })
-            
-            return result.dict()
-            
-        except Exception as e:
-            logger.error(f"Reference extraction failed: {str(e)}")
-            self.record_execution('extract_references', {'error': str(e)}, False)
-            return {
-                'success': False,
-                'error': str(e)
-            }
-    
-    async def extract_medical_segment(self, text: str, retry_count: int = 0) -> Dict[str, Any]:
-        """
-        Extract and validate medical information from text.
-        
-        Args:
-            text: Extracted document text
-            
-        Returns:
-            Dictionary containing medical segment information
-        """
-        start_time = time.time()
+        if not state.get('extract_appeals_first'):
+            return state
         
         try:
-            quality = self.assess_text_quality(text)
-            
-            if not quality['has_content']:
-                return {
-                    'success': False,
-                    'error': 'Insufficient text content'
-                }
-            
-            logger.info(f"Extracting medical context (attempt {retry_count + 1})...")
-            
-            result = await self.openai_service.extract_medical_context(text)
-            
-            # Validate
-            validation = self._validate_medical(result)
-            
-            if not validation['is_valid'] and retry_count < self.goals['max_retry_attempts']:
-                logger.warning(f"Medical validation failed, retrying...")
-                return await self.extract_medical_segment(text, retry_count + 1)
-            
-            success = validation['is_valid']
-            self.record_execution('extract_medical', {
-                'conditions_count': len(result.conditions) if hasattr(result, 'conditions') else 0,
-                'medications_count': len(result.medications) if hasattr(result, 'medications') else 0,
-                'processing_time': time.time() - start_time
-            }, success)
-            
-            return result.dict()
-            
+            appeals_text, found = self.appeals_service.extract_appeals_section(state['text'])
+            if found:
+                state['text'] = appeals_text
+                logger.info(f"Using appeals section: {len(appeals_text)} chars")
         except Exception as e:
-            logger.error(f"Medical extraction failed: {str(e)}")
-            self.record_execution('extract_medical', {'error': str(e)}, False)
-            return {
-                'success': False,
-                'error': str(e)
-            }
+            logger.warning(f"Appeals extraction failed: {e}")
         
-    async def extract_legal_segment(self, text: str, retry_count: int = 0) -> Dict[str, Any]:
+        return state
+    
+    async def _extract_references_node(self, state: SegmentationState) -> SegmentationState:
         """
-        Extract and validate legal information from text.
+        Node: Extract references
+        """
+        # Skip if not requested
+        if 'references' not in state.get('segments_to_extract', ['references']):
+            logger.info("Skipping references extraction (not requested)")
+            state['references_valid'] = True  # Mark as valid to skip validation
+            return state
         
-        Args:
-            text: Extracted document text
-            
-        Returns:
-            Dictionary containing legal segment information
-        """
-        start_time = time.time()
+        logger.info("Extracting references...")
         
         try:
-            quality = self.assess_text_quality(text)
-            
-            if not quality['has_content']:
-                return {
-                    'success': False,
-                    'error': 'Insufficient text content'
-                }
-            
-            logger.info(f"Extracting legal context (attempt {retry_count + 1})...")
-            
-            result = await self.openai_service.extract_legal_context(text)
-            
-            # Validate
-            validation = self._validate_legal(result)
-            
-            if not validation['is_valid'] and retry_count < self.goals['max_retry_attempts']:
-                logger.warning(f"Legal validation failed, retrying...")
-                return await self.extract_legal_segment(text, retry_count + 1)
-            
-            success = validation['is_valid']
-            self.record_execution('extract_legal', {
-                'claims_count': len(result.claims) if hasattr(result, 'claims') else 0,
-                'processing_time': time.time() - start_time
-            }, success)
-            
-            return result.dict()
-            
+            result = await self.openai_service.extract_references(state['text'])
+            state['references'] = result.dict()
         except Exception as e:
-            logger.error(f"Legal extraction failed: {str(e)}")
-            self.record_execution('extract_legal', {'error': str(e)}, False)
-            return {
-                'success': False,
-                'error': str(e)
-            }
+            logger.error(f"Reference extraction failed: {e}")
+            state['references'] = {'success': False, 'error': str(e)}
         
-    def _validate_references(self, result: Any) -> Dict[str, Any]:
-        """Validate reference extraction results"""
-        if not hasattr(result, 'references'):
-            return {'is_valid': False, 'reason': 'No references field'}
-        
-        ref_count = len(result.references)
-        
-        if ref_count < self.goals['min_reference_count']:
-            return {
-                'is_valid': False,
-                'reason': f'Too few references: {ref_count} < {self.goals["min_reference_count"]}'
-            }
-        
-        return {'is_valid': True, 'reference_count': ref_count}
+        return state
     
-    def _validate_medical(self, result: Any) -> Dict[str, Any]:
-        """Validate medical extraction results"""
-        if not hasattr(result, 'conditions'):
-            return {'is_valid': False, 'reason': 'No conditions field'}
+    async def _extract_medical_node(self, state: SegmentationState) -> SegmentationState:
+        """Node: Extract medical context"""
+        # Skip if not requested
+        if 'medical' not in state.get('segments_to_extract', ['medical']):
+            logger.info("Skipping medical extraction (not requested)")
+            state['medical_valid'] = True
+            return state
         
-        condition_count = len(result.conditions)
+        logger.info("Extracting medical context...")
         
-        if condition_count < self.goals['min_medical_conditions']:
-            return {
-                'is_valid': False,
-                'reason': f'No medical conditions found'
-            }
+        try:
+            result = await self.openai_service.extract_medical_context(state['text'])
+            state['medical'] = result.dict()
+        except Exception as e:
+            logger.error(f"Medical extraction failed: {e}")
+            state['medical'] = {'success': False, 'error': str(e)}
         
-        return {'is_valid': True, 'condition_count': condition_count}
+        return state
+        
+    async def _extract_legal_node(self, state: SegmentationState) -> SegmentationState:
+        """Node: Extract legal context"""
+        # Skip if not requested
+        if 'legal' not in state.get('segments_to_extract', ['legal']):
+            logger.info("Skipping legal extraction (not requested)")
+            state['legal_valid'] = True
+            return state
+        
+        logger.info("Extracting legal context...")
+        
+        try:
+            result = await self.openai_service.extract_legal_context(state['text'])
+            state['legal'] = result.dict()
+        except Exception as e:
+            logger.error(f"Legal extraction failed: {e}")
+            state['legal'] = {'success': False, 'error': str(e)}
+        
+        return state
+        
+    def _validate_references_node(self, state: SegmentationState) -> SegmentationState:
+        """Node: Validate references"""
+        
+        refs = state.get('references', {})
+        ref_count = len(refs.get('patient_details', [])) + len(refs.get('research_papers', []))
+        
+        state['references_valid'] = ref_count >= 3
+        
+        if not state['references_valid']:
+            state['references_retry_count'] += 1
+            logger.warning(f"References validation failed, retry {state['references_retry_count']}")
+        else:
+            logger.info("References validated")
+        
+        return state
     
-    def _validate_legal(self, result: Any) -> Dict[str, Any]:
-        """Validate legal extraction results"""
-        if not hasattr(result, 'claims'):
-            return {'is_valid': False, 'reason': 'No claims field'}
+    def _validate_medical_node(self, state: SegmentationState) -> SegmentationState:
+        """Node: Validate medical extraction"""
         
-        return {'is_valid': True, 'claim_count': len(result.claims)}
+        med = state.get('medical', {})
+        condition_count = len(med.get('conditions', []))
+        
+        state['medical_valid'] = condition_count >= 1
+        
+        if not state['medical_valid'] and state['medical_retry_count'] < state['max_retries']:
+            state['medical_retry_count'] += 1  # Use specific counter
+            logger.warning("Medical validation failed")
+        else:
+            logger.info("Medical validated")
+        
+        return state
+    
+    def _validate_legal_node(self, state: SegmentationState) -> SegmentationState:
+        """Node: Validate legal extraction"""
+        
+        legal = state.get('legal', {})
+        state['legal_valid'] = legal.get('success', False)
+        
+        if not state['legal_valid'] and state['legal_retry_count'] < state['max_retries']:
+            state['legal_retry_count'] += 1  # Use specific counter
+            logger.warning(f"Legal validation failed, retry {state['legal_retry_count']}")
+        else:
+            logger.info("Legal validated")
+        
+        return state
         
     def extract_appeals_section(self, text: str) -> Dict[str, Any]:
         """
@@ -273,41 +210,59 @@ class SegmentAgent(BaseAgent):
                 'found': False
             }
     
-    async def extract_all_segments(self, text: str, extract_appeals_first: bool = False) -> Dict[str, Any]:
-        """
-        Extract all segments (references, medical, legal) in one call.
+    def _finalize_node(self, state: SegmentationState) -> SegmentationState:
+        """Node: Finalize results"""
         
-        Args:
-            text: Extracted document text
-            extract_appeals_first: Whether to extract appeals section before segmentation
+        state['overall_success'] = (
+            state.get('references_valid', False) and
+            state.get('medical_valid', False) and
+            state.get('legal_valid', False)
+        )
+        
+        state['success'] = True
+        logger.info(f"Segmentation complete: overall_success={state['overall_success']}")
+        
+        return state
+    
+    async def execute(self, text: str, document_id: str, segments_to_extract: list = None, **kwargs) -> Dict[str, Any]:
         """
-        logger.info(f"{self.agent_name} executing full segmentation")
+        Execute segmentation workflow
 
-        # Optionally extract appeals section first
-        working_text = text
-        if extract_appeals_first:
-            appeals_result = self.extract_appeals_section(text)
-            if appeals_result['found']:
-                working_text = appeals_result['appeals_text']
-                logger.info(f"Using appeals section: {len(working_text)} chars")
+        Args:
+        segments_to_extract: List of segments to extract ['references', 'medical', 'legal']
+                           If None, extracts all segments (default behavior)
+        """
+        # Default to extracting all if not specified
+        if segments_to_extract is None:
+            segments_to_extract = ['references', 'medical', 'legal']
+
+        initial_state: SegmentationState = {
+            'text': text,
+            'document_id': document_id,
+            'extract_appeals_first': kwargs.get('extract_appeals_first', True),
+            'segments_to_extract': segments_to_extract,
+            'references': None,
+            'medical': None,
+            'legal': None,
+            'references_retry_count': 0,  
+            'medical_retry_count': 0,     
+            'legal_retry_count': 0, 
+            'max_retries': 2,
+            'references_valid': False,
+            'medical_valid': False,
+            'legal_valid': False,
+            'success': False,
+            'overall_success': False,
+            'error': None
+        }
         
-        # Execute all extractions
-        references = await self.extract_references(working_text)
-        medical = await self.extract_medical_segment(working_text)
-        legal = await self.extract_legal_segment(working_text)
+        logger.info("Starting LangGraph segmentation")
         
-        # Aggregate success
-        all_success = all([
-            references.get('success', True),
-            medical.get('success', True),
-            legal.get('success', True)
-        ])
-        
-        logger.info(f"Segmentation complete: success={all_success}")
+        final_state = await self.graph.ainvoke(initial_state)
         
         return {
-            'references': references,
-            'medical': medical,
-            'legal': legal,
-            'overall_success': all_success
+            'references': final_state.get('references'),
+            'medical': final_state.get('medical'),
+            'legal': final_state.get('legal'),
+            'overall_success': final_state.get('overall_success')
         }

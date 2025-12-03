@@ -1,134 +1,135 @@
 import logging
 from typing import Dict, Any
 
-from app.agents.base_agent import BaseAgent
-from app.agents.extraction_agent import ExtractionAgent
-from app.agents.segment_agent import SegmentAgent
+from langgraph.graph import StateGraph, END
+
+from app.agents.graph_state import DocumentProcessingState
+from app.agents.extraction_agent import LangGraphExtractionAgent
+from app.agents.segment_agent import LangGraphSegmentationAgent
 
 logger = logging.getLogger(__name__)
 
 
-class OrchestratorAgent(BaseAgent):
+class LangGraphOrchestratorAgent:
     """
-    Master orchestrator agent coordinating extraction and segmentation agents.
+    Master orchestrator using LangGraph.
     
-    Responsibilities:
-    - Coordinate multi-agent workflow
-    - Monitor overall pipeline health
-    - Make high-level decisions
-    - Aggregate results from sub-agents
+    Graph Flow:
+    START → extraction → check_extraction → segmentation → finalize → END
     """
     
     def __init__(self):
-        super().__init__("OrchestratorAgent")
-        
         # Initialize sub-agents
-        self.extraction_agent = ExtractionAgent()
-        self.segmentation_agent = SegmentAgent()
+        self.extraction_agent = LangGraphExtractionAgent()
+        self.segmentation_agent = LangGraphSegmentationAgent()
+        self.graph = self._build_graph()
+
+    def _build_graph(self) -> StateGraph:
+        """Build orchestration workflow"""
         
-        logger.info(f"{self.agent_name} initialized with sub-agents")
+        workflow = StateGraph(DocumentProcessingState)
+        
+        workflow.add_node("extraction", self._extraction_node)
+        workflow.add_node("check_extraction", self._check_extraction_node)
+        workflow.add_node("segmentation", self._segmentation_node)
+        workflow.add_node("finalize", self._finalize_node)
+        
+        workflow.set_entry_point("extraction")
+        workflow.add_edge("extraction", "check_extraction")
+        
+        workflow.add_conditional_edges(
+            "check_extraction",
+            lambda s: "continue" if s['extraction_complete'] else "fail",
+            {"continue": "segmentation", "fail": "finalize"}
+        )
+        
+        workflow.add_edge("segmentation", "finalize")
+        workflow.add_edge("finalize", END)
+        
+        return workflow.compile()
     
-    async def process_document(
-        self,
-        file_path: str,
-        use_preprocessing: bool = True,
-        correct_orientation: bool = True,
-        force_trocr: bool = False,
-        use_easyocr: bool = False,
-        extract_appeals_first: bool = True
-    ) -> Dict[str, Any]:
-        """
-        Orchestrate complete document processing pipeline.
+    async def _extraction_node(self, state: DocumentProcessingState) -> DocumentProcessingState:
+        """Node: Run extraction agent"""
+        logger.info("Running extraction agent...")
         
-        Workflow:
-        1. ExtractionAgent extracts text
-        2. Validate extraction
-        3. SegmentationAgent segments text
-        4. Validate segmentation
-        5. Aggregate and return results
-        """
-        logger.info(f"🎭 {self.agent_name} starting pipeline for: {file_path}")
+        result = await self.extraction_agent.execute(
+            file_path=state['file_path'],
+            document_id=state['document_id'],
+            use_preprocessing=state.get('use_preprocessing', True),
+            force_trocr=state.get('force_trocr', False)
+        )
         
-        try:
-            # Step 1: Text Extraction
-            logger.info("Step 1: Text Extraction")
-            extraction_result = self.extraction_agent.execute(
-                file_path=file_path,
-                use_preprocessing=use_preprocessing,
-                correct_orientation=correct_orientation,
-                force_trocr=force_trocr,
-                use_easyocr=use_easyocr
-            )
-            
-            extracted_text = extraction_result.get('text', '')
-            
-            # Validate extraction
-            if not extracted_text or len(extracted_text.strip()) < 50:
-                logger.warning("Insufficient text extracted")
-                return {
-                    'success': False,
-                    'error': 'Insufficient text extracted',
-                    'extraction': extraction_result
-                }
-            
-            logger.info(f"Extraction complete: {len(extracted_text)} chars, "
-                       f"confidence={extraction_result.get('confidence'):.2f}%")
-            
-            # Step 2: Text Segmentation
-            logger.info("Step 2: Text Segmentation")
-            segmentation_result = await self.segmentation_agent.extract_all_segments(
-                text=extracted_text,
-                extract_appeals_first=extract_appeals_first
-            )
-            
-            overall_success = segmentation_result.get('overall_success', False)
-            
-            logger.info(f"Segmentation complete: success={overall_success}")
-            
-            # Step 3: Aggregate results
-            final_result = {
-                'success': True,
-                'extraction': extraction_result,
-                'segmentation': segmentation_result,
-                'metadata': {
-                    'file_path': file_path,
-                    'ocr_method': extraction_result.get('method_used'),
-                    'confidence': extraction_result.get('confidence'),
-                    'processing_time': extraction_result.get('processing_time'),
-                    'text_length': len(extracted_text),
-                    'segmentation_success': overall_success
-                }
-            }
-            
-            # Record execution
-            self.record_execution('process_document', final_result, overall_success)
-            
-            logger.info(f"{self.agent_name} pipeline complete!")
-            
-            return final_result
-            
-        except Exception as e:
-            logger.error(f"{self.agent_name} pipeline failed: {str(e)}")
-            self.record_execution('process_document', {'error': str(e)}, False)
-            return {
-                'success': False,
-                'error': str(e)
-            }
+        state['extraction_result'] = result
+        state['extraction_complete'] = result.get('success', False)
+        
+        return state
     
-    def get_agent_stats(self) -> Dict[str, Any]:
-        """Get statistics from all agents"""
+    def _check_extraction_node(self, state: DocumentProcessingState) -> DocumentProcessingState:
+        """Node: Validate extraction succeeded"""
+        
+        if not state['extraction_complete']:
+            logger.error("Extraction failed")
+            state['success'] = False
+            state['error'] = "Text extraction failed"
+        else:
+            logger.info("Extraction successful")
+        
+        return state
+    
+    async def _segmentation_node(self, state: DocumentProcessingState) -> DocumentProcessingState:
+        """Node: Run segmentation agent"""
+        logger.info("Running segmentation agent...")
+        
+        extracted_text = state['extraction_result'].get('text', '')
+        
+        result = await self.segmentation_agent.execute(
+            text=extracted_text,
+            document_id=state['document_id']
+        )
+        
+        state['segmentation_result'] = result
+        state['segmentation_complete'] = True
+        
+        return state
+    
+    def _finalize_node(self, state: DocumentProcessingState) -> DocumentProcessingState:
+        """Node: Finalize pipeline results"""
+        
+        state['success'] = (
+            state.get('extraction_complete', False) and
+            state.get('segmentation_complete', False)
+        )
+        
+        logger.info(f"Pipeline complete: success={state['success']}")
+        
+        return state
+    
+    async def process_document(self, file_path: str, document_id: str, **kwargs) -> Dict[str, Any]:
+        """
+        Execute complete pipeline
+        """
+        initial_state: DocumentProcessingState = {
+            'file_path': file_path,
+            'document_id': document_id,
+            'use_preprocessing': kwargs.get('use_preprocessing', True),
+            'force_trocr': kwargs.get('force_trocr', False),
+            'extraction_state': None,
+            'extraction_complete': False,
+            'segmentation_state': None,
+            'segmentation_complete': False,
+            'success': False,
+            'extraction_result': None,
+            'segmentation_result': None,
+            'error': None
+        }
+        
+        logger.info("Starting LangGraph orchestration")
+        
+        final_state = await self.graph.ainvoke(initial_state)
+        
         return {
-            'orchestrator': {
-                'success_rate': self.get_success_rate(),
-                'total_executions': self.state['total_executions']
-            },
-            'extraction_agent': {
-                'success_rate': self.extraction_agent.get_success_rate(),
-                'total_executions': self.extraction_agent.state['total_executions'],
-                'performance_metrics': self.extraction_agent.state['performance_metrics']
-            },
-            'segmentation_agent': {
-                'success_rate': self.segmentation_agent.get_success_rate(),
-                'total_executions': self.segmentation_agent.state['total_executions']
-            }
+            'success': final_state['success'],
+            'extraction': final_state.get('extraction_result'),
+            'segmentation': final_state.get('segmentation_result'),
+            'error': final_state.get('error')
         }
