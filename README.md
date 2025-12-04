@@ -320,5 +320,5 @@ This project is part of CirrusLabs AI Detection initiative.
 ## 📞 Support
 
 For issues and questions, please create an issue on the repository or contact the development team.
-
+.
 ---
