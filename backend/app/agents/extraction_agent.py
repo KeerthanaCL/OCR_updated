@@ -157,11 +157,10 @@ class LangGraphExtractionAgent:
         try:
             # Correct orientation if needed
             if state.get('correct_orientation'):
-                corrected_image, orientation_info = self.orientation_detector.detect_and_correct_orientation(file_path)
-                if orientation_info.get('was_corrected'):
-                    corrected_path = str(Path(file_path).with_suffix('')) + '_corrected.png'
-                    corrected_image.save(corrected_path)
-                    file_path = corrected_path
+                orientation_result = self._correct_image_orientation(file_path)
+                file_path = orientation_result['path']
+                state['file_path'] = file_path
+                state['orientation_info'] = orientation_result['info']
             
             # Execute strategy
             if strategy == 'tesseract' or strategy == 'tesseract_region':
