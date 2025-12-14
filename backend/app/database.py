@@ -41,58 +41,51 @@ class Extraction(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     extraction_metadata = Column(JSON)
 
-class Parsing(Base):
-    """Parsing results database model"""
-    __tablename__ = "parsings"
+class AIDetectionResult(Base):
+    """AI Detection results storage"""
+    __tablename__ = "ai_detection_results"
     
     id = Column(String, primary_key=True, index=True)
-    extraction_id = Column(String, index=True)
-    parsed_data = Column(JSON)
-    parsing_method = Column(String)
+    extraction_id = Column(String, index=True, nullable=False)
+    is_ai_generated = Column(Boolean)
+    confidence = Column(Float)
+    detection_method = Column(String)
+    flags = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    raw_response = Column(JSON)
+
+class HorizonResult(Base):
+    """Horizon segmentation results"""
+    __tablename__ = "horizon_results"
+    
+    id = Column(String, primary_key=True, index=True)
+    extraction_id = Column(String, index=True, nullable=False)
+    segment_type = Column(String)  # 'references', 'medical', 'legal'
+    data = Column(JSON)
+    validation = Column(JSON)
     confidence = Column(Float)
     created_at = Column(DateTime, default=datetime.utcnow)
-    parsing_metadata = Column(JSON)
-
-class AppealsExtraction(Base):
-    """Appeals extraction tracking"""
-    __tablename__ = "appeals_extractions"
-    
-    id = Column(String, primary_key=True, index=True)
-    document_id = Column(String, index=True)
-    extraction_id = Column(String)  # Link to Extraction table
-    appeals_text = Column(Text)
-    appeals_found = Column(Boolean, default=False)
-    total_confidence = Column(Float)
     processing_time = Column(Float)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    appeals_metadata = Column(JSON)
 
-class AppealsSegment(Base):
-    """Individual segments from appeals"""
-    __tablename__ = "appeals_segments"
+class OrchestrationJob(Base):
+    """Job tracking for orchestrated processing"""
+    __tablename__ = "orchestration_jobs"
     
     id = Column(String, primary_key=True, index=True)
-    appeals_extraction_id = Column(String, index=True)
-    segment_type = Column(String)  # references, medical_context, legal_context
-    content = Column(Text)
-    start_position = Column(Integer)
-    end_position = Column(Integer)
-    confidence = Column(Float)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-class SegmentValidation(Base):
-    """OpenAI validation results"""
-    __tablename__ = "segment_validations"
+    extraction_id = Column(String, index=True, nullable=False)
+    status = Column(String, default="processing")  # processing, complete, failed
+    progress = Column(Integer, default=0)  # 0-100
     
-    id = Column(String, primary_key=True, index=True)
-    segment_id = Column(String, index=True)
-    status = Column(String)  # valid, invalid, partially_valid, uncertain
-    confidence_score = Column(Float)
-    reasoning = Column(Text)
-    issues_found = Column(JSON)
-    suggestions = Column(JSON)
-    openai_model_used = Column(String)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    # Results (stored as JSON, null until complete)
+    ai_detection_result = Column(JSON)
+    references_result = Column(JSON)
+    medical_result = Column(JSON)
+    legal_result = Column(JSON)
+    
+    # Tracking
+    started_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime)
+    error_message = Column(Text)
 
 # Create tables
 Base.metadata.create_all(bind=engine)
