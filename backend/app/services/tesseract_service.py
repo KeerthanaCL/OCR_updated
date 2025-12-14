@@ -4,6 +4,8 @@ import numpy as np
 from typing import Dict, Tuple, List
 import logging
 import cv2
+import os
+import shutil
 from app.config import get_settings
 from app.services.preprocessing import ImagePreprocessor
 from app.services.region_detector import RegionDetector
@@ -22,8 +24,54 @@ class TesseractService:
         self.preprocessor = ImagePreprocessor()
         self.region_detector = RegionDetector()
         
-        # Set Tesseract path if configured
-        pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        # Try to find Tesseract executable
+        tesseract_paths = [
+            r"C:\Program Files\tesseract.exe",  # Direct installation
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+            r"C:\Tesseract-OCR\tesseract.exe",
+            shutil.which("tesseract")  # Check if in PATH
+        ]
+        
+        tesseract_found = False
+        for path in tesseract_paths:
+            if path and os.path.exists(path):
+                pytesseract.pytesseract.tesseract_cmd = path
+                logger.info(f"Tesseract found at: {path}")
+                
+                # Set TESSDATA_PREFIX to the tessdata directory itself
+                tesseract_dir = os.path.dirname(path)
+                tessdata_dir = os.path.join(tesseract_dir, 'tessdata')
+                
+                # Important: Set to the tessdata directory
+                os.environ['TESSDATA_PREFIX'] = tessdata_dir + os.sep
+                logger.info(f"Set TESSDATA_PREFIX to: {tessdata_dir}")
+                
+                # Verify files exist
+                eng_data = os.path.join(tessdata_dir, 'eng.traineddata')
+                osd_data = os.path.join(tessdata_dir, 'osd.traineddata')
+                
+                if os.path.exists(eng_data):
+                    logger.info(f"eng.traineddata found at: {eng_data}")
+                else:
+                    logger.error(f"eng.traineddata NOT found at: {eng_data}")
+                    
+                if os.path.exists(osd_data):
+                    logger.info(f"osd.traineddata found at: {osd_data}")
+                else:
+                    logger.warning(f"osd.traineddata NOT found at: {osd_data}")
+                
+                # Add Tesseract directory to PATH
+                if tesseract_dir not in os.environ.get('PATH', ''):
+                    os.environ['PATH'] = tesseract_dir + os.pathsep + os.environ.get('PATH', '')
+                    logger.info(f"Added {tesseract_dir} to PATH")
+                
+                tesseract_found = True
+                break
+        
+        if not tesseract_found:
+            logger.warning("Tesseract not found. Please install from: https://github.com/UB-Mannheim/tesseract/wiki")
+            logger.warning("After installation, restart the OCR backend server")
 
         # Optimized Tesseract configuration
         # --oem 3: Use default OCR Engine Mode (LSTM + Legacy)
@@ -40,6 +88,7 @@ class TesseractService:
         }
         
         logger.info(f"TesseractService initialized with config: {self.tesseract_config}")
+        
     def extract_text_region_based(
         self, 
         image_path: str, 

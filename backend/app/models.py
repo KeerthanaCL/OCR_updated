@@ -105,22 +105,18 @@ class ReferenceItem(BaseModel):
     reference_type: str  # "research_paper", "online_resource", "patient_detail", "contact_info", etc.
     content: str
     location: Optional[str] = None
-    verified: bool = False
     priority: str = "low"  # "high", "medium", "low"
-    validation_notes: Optional[str] = None  # Why it's verified/unverified
 
 class ReferencesExtractionResponse(BaseModel):
     """Response from references extraction"""
     success: bool
     research_papers: List[ReferenceItem] = []  # High priority
     online_resources: List[ReferenceItem] = []  # High priority
-    patient_details: List[ReferenceItem] = []  # Medium priority
-    other_references: List[ReferenceItem] = []  # Low priority
     summary: str
     confidence: float
-    validation_summary: str  # Overall validation assessment
     raw_text_analyzed: str
     processing_time: float
+    usage: Optional[Dict[str, int]] = None
 
 class MedicalCondition(BaseModel):
     """Medical condition mentioned"""
@@ -128,8 +124,6 @@ class MedicalCondition(BaseModel):
     diagnosis_date: Optional[str] = None
     severity: Optional[str] = None
     treatment: Optional[str] = None
-    is_valid_condition: Optional[bool] = True  # Validated as real medical condition
-    validation_notes: Optional[str] = None  # Medical validation feedback
 
 class Medication(BaseModel):
     """Medication mentioned"""
@@ -137,9 +131,6 @@ class Medication(BaseModel):
     dosage: Optional[str] = None
     frequency: Optional[str] = None
     purpose: Optional[str] = None
-    is_valid_medication: Optional[bool] = True  # Validated as real medication
-    is_correct_dosage: Optional[bool] = True  # Dosage is within normal range
-    validation_notes: Optional[str] = None  # Pharmacy validation feedback
 
 class MedicalContextResponse(BaseModel):
     """Response from medical context extraction"""
@@ -151,10 +142,9 @@ class MedicalContextResponse(BaseModel):
     medical_necessity_argument: Optional[str] = None
     providers_mentioned: List[str] = []
     confidence: float
-    validation_summary: str  # Overall medical validation
-    medical_accuracy_score: float  # 0-1 score for medical accuracy
     raw_text_analyzed: str
     processing_time: float
+    usage: Optional[Dict[str, int]] = None
 
 class LegalClaim(BaseModel):
     """Legal claim or right mentioned"""
@@ -162,9 +152,6 @@ class LegalClaim(BaseModel):
     description: str
     relevant_statute: Optional[str] = None
     deadline: Optional[str] = None
-    is_valid_claim: Optional[bool] = True  # Validated as legitimate legal claim
-    statute_accuracy: Optional[bool] = True  # Statute citation is accurate
-    validation_notes: Optional[str] = None  # Legal validation feedback
 
 class LegalContextResponse(BaseModel):
     """Response from legal context extraction"""
@@ -175,7 +162,76 @@ class LegalContextResponse(BaseModel):
     statutes_cited: List[str] = []
     deadlines_mentioned: List[str] = []
     confidence: float
-    validation_summary: str  # Overall legal validation
-    legal_accuracy_score: float  # 0-1 score for legal accuracy
     raw_text_analyzed: str
     processing_time: float
+    usage: Optional[Dict[str, int]] = None
+
+# ============= AI DETECTION MODELS =============
+class AIDetectionRequest(BaseModel):
+    """Request for AI detection"""
+    extraction_id: str
+
+class AIDetectionResponse(BaseModel):
+    """Response from AI detection"""
+    success: bool
+    extraction_id: str
+    is_ai_generated: Optional[bool] = None
+    confidence: float
+    detection_method: str
+    flags: List[str] = []
+    summary: str
+    processing_time: float
+    error: Optional[str] = None
+
+# ============= HORIZON MODELS =============
+class HorizonRequest(BaseModel):
+    """Request for horizon segment extraction"""
+    extraction_id: str
+
+class SegmentValidation(BaseModel):
+    """Validation result for a segment"""
+    is_complete: bool
+    confidence: float
+    quality_issues: List[str] = []
+    completeness_score: float
+    missing_fields: List[str] = []
+
+class HorizonSegmentResponse(BaseModel):
+    """Response for a single horizon segment"""
+    success: bool
+    extraction_id: str
+    segment_type: str  # 'references', 'medical', 'legal'
+    data: Dict[str, Any]
+    validation: SegmentValidation
+    processing_time: float
+    error: Optional[str] = None
+
+# ============= ORCHESTRATION MODELS =============
+class ProcessRequest(BaseModel):
+    """Request to start orchestrated processing"""
+    document_id: Optional[str] = None  # For complete processing (extraction + analyses)
+    extraction_id: Optional[str] = None  # For analysis-only (text already extracted)
+
+class ProcessResponse(BaseModel):
+    """Response from orchestrator"""
+    job_id: str
+    status: str
+    message: str
+    started_at: str
+
+class JobStatusResponse(BaseModel):
+    """Job status with progressive results"""
+    job_id: str
+    extraction_id: str
+    status: str  # 'processing', 'complete', 'failed'
+    progress: int  # 0-100
+    
+    # Progressive results (null until available)
+    ai_detection: Optional[Dict[str, Any]] = None
+    references: Optional[Dict[str, Any]] = None
+    medical: Optional[Dict[str, Any]] = None
+    legal: Optional[Dict[str, Any]] = None
+    
+    started_at: str
+    completed_at: Optional[str] = None
+    error: Optional[str] = None

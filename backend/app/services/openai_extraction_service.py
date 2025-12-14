@@ -2,6 +2,7 @@ from openai import OpenAI
 import google.generativeai as genai
 import logging
 import time
+from google.api_core.exceptions import ResourceExhausted
 from typing import Dict, List, Optional
 from app.config import get_settings
 from app.models import (
@@ -13,8 +14,11 @@ from app.models import (
     LegalClaim,
     LegalContextResponse
 )
+import asyncio
 import json
 import os
+import re
+from app.utils.rate_limiter import get_gemini_rate_limiter
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -45,85 +49,162 @@ class OpenAIExtractionService:
         )
         
         logger.info(f"✅ Gemini initialized with model: {settings.gemini_model}")
+        # Initialize rate limiter (adjust RPM based on your API tier)
+        self.max_retries = 3
+        self.initial_retry_delay = 120.0  # Start with 60 seconds
+        self.max_retry_delay = 300.0  # Max 5 minutes
+        self.rate_limiter = get_gemini_rate_limiter(rpm=settings.gemini_rpm)
 
-    async def extract_references(self, text: str) -> ReferencesExtractionResponse:
+    async def _call_with_retry(self, prompt: str, operation_name: str) -> dict:
         """
-        Extract all references from appeals text using OpenAI.
-        HIGH PRIORITY: Research papers, online resources
-        MEDIUM PRIORITY: Patient details
-        LOW PRIORITY: Contact info, addresses
+        Call Gemini API with exponential backoff retry logic.
+        
+        Args:
+            prompt: The prompt to send
+            operation_name: Name of operation for logging
+            
+        Returns:
+            Parsed JSON response
+            
+        Raises:
+            ResourceExhausted: If all retries exhausted
+        """
+        retry_count = 0
+        last_exception = None
+        total_wait_time = 0.0
+        
+        while retry_count <= self.max_retries:
+            try:
+                wait_time = await self.rate_limiter.acquire()
+                if wait_time > 0:
+                    logger.info(f"Rate limiter delayed {operation_name} by {wait_time:.1f}s")
+                logger.info(f"Calling Gemini for {operation_name}... (attempt {retry_count + 1}/{self.max_retries + 1})")
+                
+                response = self.model.generate_content(prompt)
+                result = json.loads(response.text)
+                
+                if total_wait_time > 0:
+                    logger.info(
+                        f"✅ Gemini {operation_name} succeeded after {retry_count} retries "
+                        f"and {total_wait_time:.1f}s total wait time"
+                    )
+                else:
+                    logger.info(f"✅ Gemini {operation_name} succeeded on first attempt")
+                
+                return result
+                
+            except ResourceExhausted as e:
+                last_exception = e
+                retry_count += 1
+                
+                # Extract retry delay from error if available
+                error_str = str(e)
+                suggested_delay = 60.0  # Default
+                
+                match = re.search(r'retry in ([\d.]+)s', error_str)
+                if match:
+                    suggested_delay = float(match.group(1))
+                
+                # Check if daily quota is completely exhausted (limit: 0)
+                if "limit: 0" in error_str and "PerDay" in error_str:
+                    logger.error(
+                        f"DAILY quota exhausted for {operation_name}. "
+                        f"Free tier resets at midnight Pacific Time. "
+                        f"\nOptions:"
+                        f"\n   1. Wait until midnight PT for quota reset"
+                        f"\n   2. Enable billing at https://aistudio.google.com/"
+                        f"\n   3. Switch to gemini-1.5-flash model in config.py"
+                    )
+                    # Don't retry for daily quota - no point waiting
+                    raise
+                
+                # Check if we should retry
+                if retry_count > self.max_retries:
+                    logger.error(
+                        f"Gemini {operation_name} failed after {self.max_retries} retries "
+                        f"and {total_wait_time:.1f}s total wait time"
+                    )
+                    raise
+                
+                # Calculate wait time (use suggested delay, capped at max)
+                wait_time = min(suggested_delay, self.max_retry_delay)
+                total_wait_time += wait_time
+                
+                logger.warning(
+                    f"Gemini quota exceeded for {operation_name}. "
+                    f"Waiting {wait_time:.1f}s before retry {retry_count}/{self.max_retries} "
+                    f"(total wait so far: {total_wait_time:.1f}s)..."
+                )
+                
+                # Wait the suggested time
+                await asyncio.sleep(wait_time)
+                
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse Gemini response for {operation_name}: {e}")
+                # Return empty result instead of crashing
+                return {}
+                
+            except Exception as e:
+                logger.error(
+                    f"Unexpected error in Gemini {operation_name}: {e}", 
+                    exc_info=True
+                )
+                raise
+        
+        # If we get here, all retries failed
+        raise last_exception
+    
+    async def extract_references(self, text: str) -> ReferencesExtractionResponse:
+        """Extract ONLY research papers and online resources.
+        Do NOT extract patient information.
         """
         start_time = time.time()
         
-        prompt = f"""You are a medical research and document analysis expert. Extract and VALIDATE ALL references from this insurance appeals document.
+        prompt = f"""You are a medical research expert. Extract ONLY scientific references and online resources from this insurance appeals document.
 
-PRIORITIZATION:
-1. HIGH PRIORITY (research_papers): Medical research papers, clinical studies, journal articles with DOI/PMID
-2. HIGH PRIORITY (online_resources): Medical websites, clinical guidelines, treatment protocols with URLs
-3. MEDIUM PRIORITY (patient_details): Patient name, DOB, member ID, case numbers
-4. LOW PRIORITY (other_references): Phone numbers, addresses, insurance company info, provider credentials
+    **EXTRACT THESE (references):**
+    1. Research papers with DOI, PMID, or journal citations
+    2. Medical websites and URLs (https://, www.)
+    3. Clinical guidelines and protocols
 
-VALIDATION TASKS:
-- For research papers: Verify if citation format looks legitimate (author, year, journal)
-- For online resources: Check if URL format is valid and domain looks medical/authoritative
-- For patient details: Verify if format matches expected patterns (e.g., member ID format)
-- For medications/conditions mentioned: Flag if they appear incorrect or misspelled
+    **DO NOT EXTRACT (not references):**
+    - Patient names, initials, or identifiers (like "SZ", "7s")
+    - Member IDs, case numbers, medical record numbers
+    - Phone numbers, addresses, dates of birth
+    - Provider names, company names
+    - Any personal health information (PHI)
 
-Document text:
-{text[:4000]}
+    Document text:
+    {text}
 
-Return JSON with this EXACT structure:
-{{
+    Return JSON with this EXACT structure:
+    {{
     "research_papers": [
         {{
-            "reference_type": "research_paper",
-            "content": "Full citation text",
-            "location": "Where found in document",
-            "verified": true/false,
-            "priority": "high",
-            "validation_notes": "Why verified or concerns found"
+        "reference_type": "research_paper",
+        "content": "Full citation with authors, title, journal, year, DOI/PMID",
+        "location": "Where found in document",
+        "priority": "high"
         }}
     ],
     "online_resources": [
         {{
-            "reference_type": "online_resource",
-            "content": "URL or website reference",
-            "location": "Where found",
-            "verified": true/false,
-            "priority": "high",
-            "validation_notes": "URL validation status"
+        "reference_type": "online_resource",
+        "content": "Full URL (must start with http:// or https:// or www.)",
+        "location": "Where found",
+        "priority": "high"
         }}
     ],
-    "patient_details": [
-        {{
-            "reference_type": "patient_name|member_id|case_number|dob",
-            "content": "Patient detail value",
-            "location": "Where found",
-            "verified": true,
-            "priority": "medium",
-            "validation_notes": "Format validation"
-        }}
-    ],
-    "other_references": [
-        {{
-            "reference_type": "phone|address|provider|company",
-            "content": "Reference value",
-            "location": "Where found",
-            "verified": true,
-            "priority": "low",
-            "validation_notes": "Additional notes"
-        }}
-    ],
-    "summary": "Brief summary of all references found",
-    "validation_summary": "Overall assessment of reference quality and completeness",
+    "summary": "Brief summary of scientific references found",
     "confidence": 0.85
-}}
+    }}
 
-IMPORTANT: 
-- Only include references actually found in the document
-- Mark verified=true only if reference looks legitimate
-- Provide specific validation_notes for each reference
-- Return ONLY valid JSON, no markdown"""
+    CRITICAL RULES:
+    1. ONLY include actual research papers (with DOI/PMID) or URLs
+    2. DO NOT include patient initials, names, or IDs
+    3. DO NOT include company names like "Appeals Team" or "Claimable"
+    4. If no research papers found, return empty array []
+    5. Return ONLY valid JSON, no markdown"""
 
         try:
             # logger.info("Calling OpenAI for reference extraction...")
@@ -142,41 +223,43 @@ IMPORTANT:
             
             # result = json.loads(response.choices[0].message.content)
 
-            logger.info("Calling Gemini for reference extraction + validation...")
+            logger.info("Calling Gemini for reference extraction")
             
-            # Call Gemini API
-            response = self.model.generate_content(prompt)
-            
-            # Parse JSON response
-            result = json.loads(response.text)
+            # Use retry logic with automatic waiting
+            result = await self._call_with_retry(prompt, "reference_extraction")
 
             processing_time = time.time() - start_time
+
+            # Capture token usage from Gemini response
+            usage_metadata = None
             
             # Parse categorized references
             research_papers = [ReferenceItem(**ref) for ref in result.get("research_papers", [])]
             online_resources = [ReferenceItem(**ref) for ref in result.get("online_resources", [])]
-            patient_details = [ReferenceItem(**ref) for ref in result.get("patient_details", [])]
-            other_references = [ReferenceItem(**ref) for ref in result.get("other_references", [])]
             
-            total_refs = len(research_papers) + len(online_resources) + len(patient_details) + len(other_references)
+            total_refs = len(research_papers) + len(online_resources)
             
-            logger.info(f"✅ Extracted {total_refs} references (Papers: {len(research_papers)}, Online: {len(online_resources)}, Patient: {len(patient_details)}, Other: {len(other_references)}) in {processing_time:.2f}s")
+            logger.info(
+                f"Extracted {total_refs} scientific references "
+                f"(Papers: {len(research_papers)}, URLs: {len(online_resources)}) "
+                f"in {processing_time:.2f}s"
+            )
             
             return ReferencesExtractionResponse(
                 success=True,
                 research_papers=research_papers,
                 online_resources=online_resources,
-                patient_details=patient_details,
-                other_references=other_references,
+                patient_details=[],
+                other_references=[],
                 summary=result.get("summary", ""),
-                validation_summary=result.get("validation_summary", ""),
                 confidence=float(result.get("confidence", 0.8)),
                 raw_text_analyzed=text[:500] + "...",
-                processing_time=processing_time
+                processing_time=processing_time,
+                usage=usage_metadata
             )
             
         except Exception as e:
-            logger.error(f"Gemini references extraction failed: {e}", exc_info=True)
+            logger.error(f"Gemini daily quota exhausted: {e}")
             return ReferencesExtractionResponse(
                 success=False,
                 research_papers=[],
@@ -184,7 +267,6 @@ IMPORTANT:
                 patient_details=[],
                 other_references=[],
                 summary=f"Extraction failed: {str(e)}",
-                validation_summary="Validation could not be performed due to extraction failure",
                 confidence=0.0,
                 raw_text_analyzed=text[:500] + "...",
                 processing_time=time.time() - start_time
@@ -192,77 +274,56 @@ IMPORTANT:
     
     async def extract_medical_context(self, text: str) -> MedicalContextResponse:
         """
-        Extract and VALIDATE medical context including conditions and medications.
-        Validates: Real medical conditions, legitimate medications, correct dosages.
+        Extract medical context including conditions, medications, and medical history.
+        No validation - pure extraction.
         """
         start_time = time.time()
         
-        prompt = f"""You are a medical expert with knowledge of conditions, medications, and clinical standards. Extract and VALIDATE all medical information from this insurance appeals document.
+        prompt = f"""You are a medical expert. Extract all medical information from this insurance appeals document.
 
-VALIDATION REQUIREMENTS:
-
-CONDITIONS:
-- Verify each condition is a real, recognized medical diagnosis
-- Check if condition name is spelled correctly
-- Assess if severity/treatment mentioned makes medical sense
-- Flag any conditions that seem incorrect or misspelled
-
-MEDICATIONS:
-- Verify each medication is a real, FDA-approved drug (check against your knowledge)
-- Validate dosage is within normal therapeutic range for that medication
-- Check if frequency (e.g., "twice daily") is appropriate for the medication
-- Flag any medications with incorrect names, dosages, or suspicious details
-
-MEDICAL HISTORY:
-- Assess if medical history is coherent and medically logical
-- Check if family history correlates with patient's conditions
-- Verify if medical necessity argument is medically sound
+Extract the following:
+- Patient information
+- Medical conditions with diagnosis dates, severity, and treatments
+- Medications with dosages, frequency, and purpose
+- Medical history summary
+- Medical necessity argument (why treatment is needed)
+- Healthcare providers mentioned
 
 Document text:
-{text[:4000]}
+{text}
 
 Return JSON with this EXACT structure:
 {{
-    "patient_name": "Patient name or null",
-    "conditions": [
-        {{
-            "condition": "Medical condition name",
-            "diagnosis_date": "Date or null",
-            "severity": "mild|moderate|severe or null",
-            "treatment": "Current treatment or null",
-            "is_valid_condition": true/false,
-            "validation_notes": "Medical validation: Is this a real condition? Spelling correct? Makes clinical sense?"
-        }}
-    ],
-    "medications": [
-        {{
-            "name": "Medication name",
-            "dosage": "Dosage or null",
-            "frequency": "Frequency or null",
-            "purpose": "Why prescribed or null",
-            "is_valid_medication": true/false,
-            "is_correct_dosage": true/false,
-            "validation_notes": "Pharmacy validation: Real medication? Dosage within normal range? Appropriate frequency?"
-        }}
-    ],
-    "medical_history": "Comprehensive summary of patient's medical background",
-    "medical_necessity_argument": "Why the patient needs the denied treatment/medication",
-    "providers_mentioned": ["List of doctors/providers mentioned"],
-    "validation_summary": "Overall medical validation: Are all conditions real? All medications legitimate? Dosages correct? Medical history coherent?",
-    "medical_accuracy_score": 0.9,
-    "confidence": 0.85
+  "patient_name": "Patient name or null",
+  "conditions": [
+    {{
+      "condition": "Medical condition name",
+      "diagnosis_date": "Date or null",
+      "severity": "mild|moderate|severe or null",
+      "treatment": "Current treatment or null"
+    }}
+  ],
+  "medications": [
+    {{
+      "name": "Medication name",
+      "dosage": "Dosage or null",
+      "frequency": "Frequency or null",
+      "purpose": "Why prescribed or null"
+    }}
+  ],
+  "medical_history": "Comprehensive summary of patient's medical background",
+  "medical_necessity_argument": "Why the patient needs the denied treatment/medication",
+  "providers_mentioned": ["List of doctors/providers mentioned"],
+  "confidence": 0.85
 }}
 
 IMPORTANT:
-- Mark is_valid_condition=false if condition seems incorrect/misspelled
-- Mark is_valid_medication=false if medication name is wrong
-- Mark is_correct_dosage=false if dosage is outside therapeutic range
-- Provide detailed validation_notes explaining your assessment
-- medical_accuracy_score should be 0-1 based on overall medical accuracy
+- Extract all information as-is from the document
+- Do not validate or verify medical information
 - Return ONLY valid JSON, no markdown"""
 
         try:
-            logger.info("Calling Gemini for medical extraction + validation...")
+            logger.info("Calling Gemini for medical extraction")
 
             # response = await self.client.chat.completions.create(
             #     model=self.model,
@@ -277,10 +338,11 @@ IMPORTANT:
             # )
             
             # result = json.loads(response.choices[0].message.content)
-            response = self.model.generate_content(prompt)
-            result = json.loads(response.text)
+            result = await self._call_with_retry(prompt, "medical_extraction")
             processing_time = time.time() - start_time
-            
+
+            # Capture token usage
+            usage_metadata = None
             conditions = [
                 MedicalCondition(**cond) for cond in result.get("conditions", [])
             ]
@@ -289,12 +351,10 @@ IMPORTANT:
                 Medication(**med) for med in result.get("medications", [])
             ]
             
-            # Count validation issues
-            invalid_conditions = sum(1 for c in conditions if not c.is_valid_condition)
-            invalid_meds = sum(1 for m in medications if not m.is_valid_medication)
-            incorrect_dosages = sum(1 for m in medications if not m.is_correct_dosage)
-            
-            logger.info(f"✅ Extracted medical context: {len(conditions)} conditions ({invalid_conditions} flagged), {len(medications)} medications ({invalid_meds} invalid, {incorrect_dosages} dosage issues) in {processing_time:.2f}s")
+            logger.info(
+                f"Extracted medical context: {len(conditions)} conditions, "
+                f"{len(medications)} medications in {processing_time:.2f}s"
+            )
             
             return MedicalContextResponse(
                 success=True,
@@ -304,11 +364,10 @@ IMPORTANT:
                 medical_history=result.get("medical_history", ""),
                 medical_necessity_argument=result.get("medical_necessity_argument"),
                 providers_mentioned=result.get("providers_mentioned", []),
-                validation_summary=result.get("validation_summary", ""),
-                medical_accuracy_score=float(result.get("medical_accuracy_score", 0.8)),
                 confidence=float(result.get("confidence", 0.8)),
                 raw_text_analyzed=text[:500] + "...",
-                processing_time=processing_time
+                processing_time=processing_time,
+                usage=usage_metadata
             )
             
         except Exception as e:
@@ -321,7 +380,6 @@ IMPORTANT:
                 medical_history=f"Extraction failed: {str(e)}",
                 medical_necessity_argument=None,
                 providers_mentioned=[],
-                validation_summary="Validation could not be performed",
                 medical_accuracy_score=0.0,
                 confidence=0.0,
                 raw_text_analyzed=text[:500] + "...",
@@ -330,63 +388,43 @@ IMPORTANT:
     
     async def extract_legal_context(self, text: str) -> LegalContextResponse:
         """
-        Extract and VALIDATE legal context including claims, statutes, and procedures.
-        Validates: Legitimate legal claims, accurate statute citations, proper procedures.
+        Extract legal context including claims, statutes, and deadlines.
+        No validation - pure extraction.
         """
         start_time = time.time()
         
-        prompt = f"""You are a legal expert specializing in insurance law, ERISA, PPACA, and healthcare regulations. Extract and VALIDATE all legal information from this insurance appeals document.
+        prompt = f"""You are a legal expert specializing in insurance appeals. Extract all legal information from this appeals document.
 
-VALIDATION REQUIREMENTS:
-
-LEGAL CLAIMS:
-- Verify each claim is a legitimate legal right (e.g., appeal rights, ERISA protections)
-- Check if claim description is legally accurate
-- Assess if claim is applicable to insurance appeals
-
-STATUTES & REGULATIONS:
-- Validate statute citations are real (e.g., ERISA Section 502, PPACA provisions)
-- Check if statute citation format is correct
-- Verify statute is relevant to the claim being made
-
-DEADLINES:
-- Check if deadlines mentioned are standard for appeals (e.g., 180 days, 72 hours)
-- Verify deadline format is clear and specific
-
-LEGAL PROCEDURES:
-- Assess if described procedures are standard for insurance appeals
-- Check if legal arguments are coherent and properly structured
+Extract the following:
+- Type of appeal
+- Legal claims being made
+- Statutes or regulations cited
+- Deadlines mentioned
+- Legal arguments summary
 
 Document text:
-{text[:4000]}
+{text}
 
 Return JSON with this EXACT structure:
 {{
-    "legal_claims": [
-        {{
-            "claim_type": "appeal_right|erisa_right|ppaca_right|denial_challenge|other",
-            "description": "What legal claim is being made",
-            "relevant_statute": "Statute citation or null",
-            "deadline": "Deadline or null",
-            "is_valid_claim": true/false,
-            "statute_accuracy": true/false,
-            "validation_notes": "Legal validation: Is this a real legal right? Statute citation correct? Applicable to insurance appeals?"
-        }}
-    ],
-    "appeal_type": "standard|expedited|external_review or null",
-    "legal_summary": "Summary of legal arguments and rights asserted",
-    "statutes_cited": ["List of all statutes/regulations mentioned"],
-    "deadlines_mentioned": ["List of all deadlines with context"],
-    "validation_summary": "Overall legal validation: Are claims legitimate? Statutes accurate? Procedures proper?",
-    "legal_accuracy_score": 0.9,
-    "confidence": 0.85
+  "appeal_type": "Type of appeal (e.g., insurance denial appeal, medical necessity appeal)",
+  "legal_claims": [
+    {{
+      "claim_type": "Type of claim",
+      "description": "Detailed description of the claim",
+      "relevant_statute": "Statute or regulation cited or null",
+      "deadline": "Deadline mentioned or null"
+    }}
+  ],
+  "legal_summary": "Summary of the legal arguments being made",
+  "statutes_cited": ["List of statutes/regulations cited"],
+  "deadlines_mentioned": ["List of deadlines mentioned"],
+  "confidence": 0.85
 }}
 
 IMPORTANT:
-- Mark is_valid_claim=false if claim is not a recognized legal right
-- Mark statute_accuracy=false if statute citation is incorrect or doesn't exist
-- Provide detailed validation_notes explaining legal assessment
-- legal_accuracy_score should be 0-1 based on overall legal accuracy
+- Extract all information as-is from the document
+- Do not validate or verify legal information
 - Return ONLY valid JSON, no markdown"""
 
         try:
@@ -405,19 +443,19 @@ IMPORTANT:
             # result = json.loads(response.choices[0].message.content)
             logger.info("Calling Gemini for legal extraction...")
             
-            response = self.model.generate_content(prompt)
-            result = json.loads(response.text)
+            result = await self._call_with_retry(prompt, "legal_extraction")
             processing_time = time.time() - start_time
-            
+
+            # Capture token usage
+            usage_metadata = None
             legal_claims = [
                 LegalClaim(**claim) for claim in result.get("legal_claims", [])
             ]
             
-            # Count validation issues
-            invalid_claims = sum(1 for c in legal_claims if not c.is_valid_claim)
-            inaccurate_statutes = sum(1 for c in legal_claims if not c.statute_accuracy)
-            
-            logger.info(f"Extracted legal context: {len(legal_claims)} claims ({invalid_claims} invalid, {inaccurate_statutes} statute errors) in {processing_time:.2f}s")
+            logger.info(
+                f"Extracted legal context: {len(legal_claims)} claims, "
+                f"{len(result.get('statutes_cited', []))} statutes in {processing_time:.2f}s"
+            )
             
             return LegalContextResponse(
                 success=True,
@@ -426,11 +464,10 @@ IMPORTANT:
                 legal_summary=result.get("legal_summary", ""),
                 statutes_cited=result.get("statutes_cited", []),
                 deadlines_mentioned=result.get("deadlines_mentioned", []),
-                validation_summary=result.get("validation_summary", ""),
-                legal_accuracy_score=float(result.get("legal_accuracy_score", 0.8)),
                 confidence=float(result.get("confidence", 0.8)),
                 raw_text_analyzed=text[:500] + "...",
-                processing_time=processing_time
+                processing_time=processing_time,
+                usage=usage_metadata
             )
             
         except Exception as e:
@@ -442,8 +479,6 @@ IMPORTANT:
                 legal_summary=f"Extraction failed: {str(e)}",
                 statutes_cited=[],
                 deadlines_mentioned=[],
-                validation_summary="Validation could not be performed",
-                legal_accuracy_score=0.0,
                 confidence=0.0,
                 raw_text_analyzed=text[:500] + "...",
                 processing_time=time.time() - start_time
