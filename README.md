@@ -232,7 +232,7 @@ pytest --cov=app
 
 ### OCR Settings
 - **Tesseract Confidence Threshold**: 60
-- **Tesseract Language**: English (eng) - modify in config
+- **Tesseract Language**: English (eng) - modify in config 
 - **TrOCR Model**: 
   - Printed text: `microsoft/trocr-base-printed`
   - Handwritten: `microsoft/trocr-base-handwritten`
@@ -320,5 +320,5 @@ This project is part of CirrusLabs AI Detection initiative.
 ## 📞 Support
 
 For issues and questions, please create an issue on the repository or contact the development team.
-
+.
 ---

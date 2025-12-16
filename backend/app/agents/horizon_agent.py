@@ -45,8 +45,8 @@ class HorizonAgent:
             return {
                 "success": True,
                 "data": {
-                    "research_papers": result.research_papers,
-                    "online_resources": result.online_resources,
+                    "research_papers": [r.dict() for r in result.research_papers], 
+                    "online_resources": [r.dict() for r in result.online_resources],
                     "summary": result.summary,
                     "total_count": len(result.research_papers) + len(result.online_resources)
                 },
