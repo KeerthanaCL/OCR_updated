@@ -5,36 +5,46 @@ from app.models import (
     DocumentStatus,
     OCRMethod
 )
-from app.agents.orchestrator import LangGraphOrchestratorAgent
+from app.agents.orchestrator_agent import OrchestratorAgent
 from app.services.storage import StorageService
-from app.database import get_db, Document, Extraction, AppealsExtraction, AppealsSegment
+from app.database import get_db, Document, Extraction
+import numpy as np
 import uuid
 import logging
 
 logger = logging.getLogger(__name__)
 
+def convert_numpy_types(obj):
+    """Convert numpy types to native Python types for JSON serialization"""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: convert_numpy_types(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_types(item) for item in obj]
+    return obj
+
 router = APIRouter(prefix="/api/v1", tags=["extraction"])
 
 # Global orchestrator instance
-orchestrator = LangGraphOrchestratorAgent()
+orchestrator = OrchestratorAgent()
 
 @router.post("/extract")
-async def extract_and_segment_document(
+async def extract_document(
     request: ExtractionRequest,
     db: Session = Depends(get_db)
 ):
     """
-    Complete document processing pipeline:
-    1. Retrieve document using document_id
-    2. Extract text via OCR (Tesseract/EasyOCR/TrOCR)
-    3. Segment text into references, medical, and legal contexts
-    4. Save all results to database
+    Extract text from uploaded document (Page 1)
     
-    Args:
-        request: ExtractionRequest with document_id and processing options
-        
-    Returns:
-        Complete extraction and segmentation results
+    This endpoint only performs OCR extraction.
+    For analysis, use either:
+    - Approach 1: Individual endpoints (/ai-detection, /horizon/*)
+    - Approach 2: Orchestrated processing (/process, /status)
     """
     try:
         # Step 1: Get document from database
@@ -53,11 +63,9 @@ async def extract_and_segment_document(
         logger.info(f"Processing document: {document.filename} (ID: {request.document_id})")
         
         # Step 3: Execute complete processing pipeline via orchestrator
-        result = await orchestrator.process_document(
-            file_path=file_path,
+        result = await orchestrator.extract_only(
             document_id=request.document_id,
-            use_preprocessing=request.use_preprocessing,
-            force_trocr=request.force_trocr
+            db=db
         )
         
         if not result.get('success'):
@@ -68,99 +76,39 @@ async def extract_and_segment_document(
                 detail=result.get('error', 'Processing failed')
             )
         
-        extraction_data = result['extraction']
-        segmentation_data = result['segmentation']
-        
-        # Step 4: Save extraction results to database
-        extraction_id = str(uuid.uuid4())
-        
-        # Handle OCR method enum conversion
-        method_used_str = extraction_data['method_used']
-        try:
-            method_used_enum = OCRMethod(method_used_str)
-        except ValueError:
-            method_used_enum = OCRMethod.TESSERACT
-        
-        db_extraction = Extraction(
-            id=extraction_id,
-            document_id=request.document_id,
-            text=extraction_data['text'],
-            confidence=extraction_data['confidence'],
-            method_used=method_used_str,
-            pages=extraction_data.get('pages', extraction_data.get('metadata', {}).get('page_count', 1)),
-            processing_time=extraction_data['processing_time'],
-            extraction_metadata=extraction_data.get('metadata', {})
-        )
-        db.add(db_extraction)
-        
-        # Step 5: Save appeals extraction metadata
-        appeals_extraction_id = str(uuid.uuid4())
-        db_appeals_extraction = AppealsExtraction(
-            id=appeals_extraction_id,
-            document_id=request.document_id,
-            extraction_id=extraction_id,
-            appeals_text=extraction_data['text'],  # Full extracted text
-            appeals_found=True,
-            total_confidence=extraction_data['confidence'],
-            processing_time=extraction_data['processing_time'],
-            appeals_metadata=result.get('metadata', {})
-        )
-        db.add(db_appeals_extraction)
-        
-        # Step 6: Save segmented data (references, medical, legal)
-        segments_to_save = [
-            {
-                'type': 'references',
-                'data': segmentation_data.get('references', {})
-            },
-            {
-                'type': 'medical',
-                'data': segmentation_data.get('medical', {})
-            },
-            {
-                'type': 'legal',
-                'data': segmentation_data.get('legal', {})
-            }
-        ]
-        
-        for segment in segments_to_save:
-            segment_id = str(uuid.uuid4())
-            db_segment = AppealsSegment(
-                id=segment_id,
-                appeals_extraction_id=appeals_extraction_id,
-                segment_type=segment['type'],
-                content=str(segment['data']),  # Convert to JSON string
-                confidence=segment['data'].get('confidence', 0.0) if isinstance(segment['data'], dict) else 0.0
-            )
-            db.add(db_segment)
-        
-        # Step 7: Update document status to completed
+        extraction_id = result['extraction_id']
+
+        # Step 3: Update document status
         document.status = DocumentStatus.COMPLETED.value
         db.commit()
+
+        logger.info(f"Document extraction completed: {extraction_id}")
+
+        # Step 4: Return extraction result
+        extraction = db.query(Extraction).filter(Extraction.id == extraction_id).first()
+
+        if not extraction:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Extraction record not found in database for ID: {extraction_id}"
+            )
         
-        logger.info(f"✅ Document processing completed: {extraction_id}")
-        
-        # Step 8: Return complete results
         return {
             'success': True,
             'document_id': request.document_id,
             'extraction_id': extraction_id,
-            'extraction': {
-                'text': extraction_data['text'],
-                'confidence': extraction_data['confidence'],
-                'method_used': method_used_enum.value,
-                'pages': extraction_data['pages'],
-                'processing_time': extraction_data['processing_time']
-            },
-            'segmentation': segmentation_data,
-            'metadata': result.get('metadata', {})
+            'text': extraction.text or '',
+            'confidence': float(extraction.confidence or 0.0),
+            'method_used': extraction.method_used or 'unknown',
+            'pages': extraction.pages or 0,
+            'processing_time': float(extraction.processing_time or 0.0),
+            'metadata': extraction.extraction_metadata or {}
         }
         
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Document file not found on storage")
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Extraction failed: {str(e)}", exc_info=True)
-        # Update status to failed
+        logger.error(f"Extraction failed: {e}", exc_info=True)
         if 'document' in locals():
             document.status = DocumentStatus.FAILED.value
             db.commit()
@@ -169,24 +117,15 @@ async def extract_and_segment_document(
 
 @router.get("/extract/status/{document_id}")
 async def get_extraction_status(document_id: str, db: Session = Depends(get_db)):
-    """
-    Get extraction status for a document.
-    
-    Args:
-        document_id: Document ID
-        
-    Returns:
-        Status and results if available
-    """
+    """Get extraction status for a document."""
     document = db.query(Document).filter(Document.id == document_id).first()
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
-    
-    # Get latest extraction for this document
+
     extraction = db.query(Extraction).filter(
         Extraction.document_id == document_id
     ).order_by(Extraction.created_at.desc()).first()
-    
+
     response = {
         'document_id': document_id,
         'status': document.status,
@@ -194,7 +133,7 @@ async def get_extraction_status(document_id: str, db: Session = Depends(get_db))
         'created_at': document.created_at.isoformat(),
         'updated_at': document.updated_at.isoformat()
     }
-    
+
     if extraction:
         response['extraction'] = {
             'extraction_id': extraction.id,
@@ -204,5 +143,5 @@ async def get_extraction_status(document_id: str, db: Session = Depends(get_db))
             'processing_time': extraction.processing_time,
             'text_length': len(extraction.text) if extraction.text else 0
         }
-    
+
     return response

@@ -13,6 +13,11 @@ from app.services.easyocr_service import EasyOCRService
 from app.services.pdf_converter import PDFConverter
 from app.services.orientation_detector import OrientationDetector
 from app.services.region_detector import RegionDetector
+from app.utils.metrics import MetricsCollector
+from app.database import Document, Extraction
+from app.services.storage import StorageService
+from sqlalchemy.orm import Session
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +195,8 @@ class LangGraphExtractionAgent:
             state['attempted_methods'].append(method)
             
             logger.info(f"Extracted: confidence={confidence:.2f}%, method={method}")
+
+            latency_ms = (time.time() - start_time) * 1000
             
         except Exception as e:
             logger.error(f"Extraction failed: {e}")
@@ -272,53 +279,187 @@ class LangGraphExtractionAgent:
             return {'path': image_path, 'info': {'was_corrected': False, 'error': str(e)}}
         
     async def execute(
-        self, file_path: str, document_id: str, **kwargs
+        self, document_id: str, db: Session, **kwargs
     ) -> Dict[str, Any]:
         """
         Execute the LangGraph workflow
         """
-        logger.info(f"Starting LangGraph extraction for: {file_path}")
+        metrics = MetricsCollector("extraction_agent").start()
+        logger.info(f"Starting LangGraph extraction for: {document_id}")
     
-        # Handle PDF conversion
-        if self._is_pdf(file_path):
-            return await self._process_pdf(file_path, document_id, **kwargs)
-        
-        # Initialize state
-        initial_state: ExtractionState = {
-            'file_path': file_path,
-            'document_id': document_id,
-            'use_preprocessing': kwargs.get('use_preprocessing', True),
-            'force_trocr': kwargs.get('force_trocr', False),
-            'correct_orientation': kwargs.get('correct_orientation', True),
-            'doc_analysis': None,
-            'chosen_strategy': None,
-            'attempted_methods': [],
-            'extracted_text': None,
-            'confidence': 0.0,
-            'method_used': None,
-            'processing_time': 0.0,
-            'retry_count': 0,
-            'max_retries': 2,
-            'target_confidence': 70.0,
-            'success': False,
-            'error': None,
-            'metadata': {}
-        }
-        
-        # Run the graph
-        final_state = await self.graph.ainvoke(initial_state)
-        
-        # Return result
-        return {
-            'text': final_state.get('extracted_text', ''),
-            'confidence': final_state.get('confidence', 0.0),
-            'method_used': final_state.get('method_used'),
-            'pages': 1,
-            'processing_time': final_state.get('processing_time'),
-            'attempted_methods': final_state.get('attempted_methods', []),
-            'success': final_state.get('success'),
-            'metadata': final_state.get('metadata', {})
-        }
+        try:
+            storage = StorageService()
+            file_path = storage.get_file_path(document_id)
+            logger.info(f"File path resolved: {file_path}")
+            
+            # Get document from database
+            document = db.query(Document).filter(Document.id == document_id).first()
+            if not document:
+                raise ValueError(f"Document {document_id} not found")
+            
+            # Rest of your code continues here...
+            # Handle PDF conversion
+            if self._is_pdf(file_path):
+                result = await self._process_pdf(file_path, document_id, **kwargs)
+                
+                # Save to database
+                extraction_id = str(uuid.uuid4())
+                db_extraction = Extraction(
+                    id=extraction_id,
+                    document_id=document_id,
+                    text=result.get('text', ''),
+                    confidence=float(result.get('confidence', 0.0)),
+                    method_used=result.get('method_used', 'multi-page'),
+                    pages=result.get('pages', 1),
+                    processing_time=float(result.get('processing_time', 0.0)),
+                    extraction_metadata=result.get('metadata', {})
+                )
+                db.add(db_extraction)
+                db.commit()
+                db.refresh(db_extraction)
+                
+                metrics.add_custom_metric('document_type', 'pdf')
+                metrics.add_custom_metric('total_pages', result.get('pages', 1))
+                metrics.add_custom_metric('avg_confidence', result.get('confidence', 0))
+                
+                final_metrics = metrics.complete(success=result.get('success', False))
+                
+                return {
+                    'success': True,
+                    'extraction_id': extraction_id,
+                    'text': result.get('text'),
+                    'confidence': result.get('confidence'),
+                    'method_used': result.get('method_used'),
+                    'pages': result.get('pages'),
+                    'processing_time': result.get('processing_time'),
+                    'metadata': result.get('metadata'),
+                    'metrics': final_metrics
+                }
+            
+            # Image processing (existing code continues...)
+            metrics.add_custom_metric('document_type', 'image')
+            
+            initial_state: ExtractionState = {
+                'file_path': file_path,
+                'document_id': document_id,
+                'use_preprocessing': kwargs.get('use_preprocessing', True),
+                'force_trocr': kwargs.get('force_trocr', False),
+                'correct_orientation': kwargs.get('correct_orientation', True),
+                'doc_analysis': None,
+                'chosen_strategy': None,
+                'attempted_methods': [],
+                'extracted_text': None,
+                'confidence': 0.0,
+                'method_used': None,
+                'processing_time': 0.0,
+                'retry_count': 0,
+                'max_retries': 2,
+                'target_confidence': 70.0,
+                'success': False,
+                'error': None,
+                'metadata': {}
+            }
+            
+            # Run the graph
+            final_state = await self.graph.ainvoke(initial_state)
+            
+            # Save to database
+            extraction_id = str(uuid.uuid4())
+            
+            extracted_text = final_state.get('extracted_text')
+            if not extracted_text:
+                raise Exception("No text extracted from document")
+            
+            db_extraction = Extraction(
+                id=extraction_id,
+                document_id=document_id,
+                text=extracted_text,
+                confidence=float(final_state.get('confidence', 0.0)),
+                method_used=final_state.get('method_used', 'tesseract'),
+                pages=1,
+                processing_time=float(final_state.get('processing_time', 0.0)),
+                extraction_metadata=final_state.get('metadata', {})
+            )
+            
+            db.add(db_extraction)
+            db.commit()
+            db.refresh(db_extraction)
+            
+            # Extract metrics from final state
+            confidence = float(final_state.get("confidence", 0))
+            target_confidence = float(final_state.get("target_confidence", 70.0))
+            attempted_methods = final_state.get("attempted_methods", [])
+            retry_count = int(final_state.get("retry_count", 0))
+            
+            # Add extraction metrics
+            metrics.add_custom_metric('confidence_score', confidence)
+            metrics.add_custom_metric('target_confidence', target_confidence)
+            metrics.add_custom_metric('confidence_gap', target_confidence - confidence)
+            metrics.add_custom_metric('ocr_method_used', final_state.get("method_used"))
+            metrics.add_custom_metric('attempted_methods', attempted_methods)
+            metrics.add_custom_metric('retry_count', retry_count)
+            metrics.add_custom_metric('fallback_used', retry_count > 0)
+            metrics.add_custom_metric('text_length', len(extracted_text))
+            metrics.add_custom_metric('word_count', len(extracted_text.split()))
+            metrics.add_custom_metric('quality_tier', self._get_quality_tier(confidence))
+            
+            # Document analysis metrics
+            doc_analysis = final_state.get('doc_analysis', {})
+            if doc_analysis and not doc_analysis.get('analysis_failed'):
+                metrics.add_custom_metric('document_quality', doc_analysis.get('quality'))
+                metrics.add_custom_metric('text_regions', doc_analysis.get('num_regions'))
+                metrics.add_custom_metric('layout_complexity',
+                    'complex' if doc_analysis.get('is_complex_layout')
+                    else 'simple' if doc_analysis.get('is_simple_layout')
+                    else 'medium')
+            
+            # Success criteria metrics
+            task_completed = final_state.get("success", False)
+            goal_achieved = confidence >= target_confidence
+            
+            metrics.add_custom_metric('task_completed', task_completed)
+            metrics.add_custom_metric('goal_achieved', goal_achieved)
+            metrics.add_custom_metric('success_rate', 100.0 if task_completed else 0.0)
+            
+            # Record errors if any
+            if final_state.get('error'):
+                metrics.record_error(final_state.get('error'))
+            
+            # Finalize metrics
+            final_metrics = metrics.complete(success=task_completed)
+            
+            # Return result with metrics
+            return {
+                "success": True,
+                "extraction_id": extraction_id,
+                "text": extracted_text,
+                "confidence": confidence,
+                "method_used": final_state.get("method_used"),
+                "pages": 1,
+                "processing_time": final_state.get("processing_time"),
+                "attempted_methods": attempted_methods,
+                "metadata": final_state.get("metadata", {}),
+                "metrics": final_metrics
+            }
+            
+        except Exception as e:
+            logger.error(f"Extraction failed with exception: {e}", exc_info=True)
+            metrics.record_error(str(e), severity='critical')
+            final_metrics = metrics.complete(success=False)
+            
+            return {
+                "success": False,
+                "extraction_id": None,
+                "error": str(e),
+                "text": "",
+                "confidence": 0.0,
+                "method_used": None,
+                "pages": 0,
+                "processing_time": 0.0,
+                "attempted_methods": [],
+                "metadata": {},
+                "metrics": final_metrics
+            }
     
     async def _process_pdf(
         self, 
@@ -402,3 +543,16 @@ class LangGraphExtractionAgent:
                 logger.info("Cleaned up temporary images")
         except Exception as e:
             logger.warning(f"Failed to cleanup temp images: {str(e)}")
+
+    def _get_quality_tier(self, confidence: float) -> str:
+        """Categorize confidence into quality tiers"""
+        if confidence >= 90:
+            return 'excellent'
+        elif confidence >= 75:
+            return 'good'
+        elif confidence >= 60:
+            return 'acceptable'
+        elif confidence >= 40:
+            return 'poor'
+        else:
+            return 'very_poor'

@@ -1,0 +1,277 @@
+"""
+Orchestrator Agent
+Coordinates extraction and all analyses (AI Detection + Horizon segments)
+"""
+import logging
+import asyncio
+import uuid
+from datetime import datetime
+from typing import Dict
+from sqlalchemy.orm import Session
+
+from app.agents.extraction_agent import LangGraphExtractionAgent
+from app.agents.horizon_agent import HorizonAgent
+from app.services.ai_detection_service import get_ai_detection_service
+from app.database import get_db, Extraction, OrchestrationJob
+
+logger = logging.getLogger(__name__)
+
+class OrchestratorAgent:
+    """
+    Master coordinator for document processing workflow.
+    Manages extraction and parallel analysis.
+    """
+    
+    def __init__(self):
+        self.extraction_agent = LangGraphExtractionAgent()
+        self.horizon_agent = HorizonAgent()
+        self.ai_detection_service = get_ai_detection_service()
+        logger.info("Orchestrator Agent initialized")
+    
+    async def extract_only(self, document_id: str, db: Session) -> Dict:
+        """
+        Phase 1: Extract text only (for Page 1)
+        
+        Args:
+            document_id: Document ID to process
+            db: Database session
+            
+        Returns:
+            Dict with extraction_id
+        """
+        try:
+            logger.info(f"Starting extraction for document: {document_id}")
+            
+            # Run extraction agent
+            result = await self.extraction_agent.execute(document_id, db)
+            
+            extraction_id = result.get('extraction_id')
+            
+            logger.info(f"Extraction complete: {extraction_id}")
+            
+            return {
+                "success": True,
+                "extraction_id": extraction_id,
+                "status": "complete"
+            }
+            
+        except Exception as e:
+            logger.error(f"Extraction failed: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e)
+            }
+    
+    async def process_full_analysis(self, extraction_id: str, db: Session) -> str:
+        """
+        Phase 2: Start full analysis (AI Detection + Horizon) in background
+        
+        Args:
+            extraction_id: ID of extracted text
+            db: Database session
+            
+        Returns:
+            job_id for tracking
+        """
+        # Create job record
+        job_id = str(uuid.uuid4())
+        
+        job = OrchestrationJob(
+            id=job_id,
+            extraction_id=extraction_id,
+            status="processing",
+            progress=0,
+            started_at=datetime.utcnow()
+        )
+        db.add(job)
+        db.commit()
+        
+        # Start background processing (don't await)
+        asyncio.create_task(self._run_full_analysis(job_id, extraction_id, db))
+        
+        logger.info(f"Started orchestrated processing: job_id={job_id}")
+        
+        return job_id
+    
+    async def process_complete(self, document_id: str, db: Session) -> str:
+        """
+        Complete processing: Extraction + All Analyses in one job.
+        
+        Args:
+            document_id: Document ID to process
+            db: Database session
+            
+        Returns:
+            job_id for tracking
+        """
+        import uuid
+        from datetime import datetime
+        from app.database import OrchestrationJob
+        
+        # Create job record
+        job_id = str(uuid.uuid4())
+        job = OrchestrationJob(
+            id=job_id,
+            extraction_id="pending",  # Will be updated after extraction
+            status="processing",
+            progress=0,
+            started_at=datetime.utcnow()
+        )
+        db.add(job)
+        db.commit()
+        
+        # Start background processing (extraction + analyses)
+        asyncio.create_task(self._run_complete_processing(job_id, document_id, db))
+        
+        logger.info(f"Started complete processing: job_id={job_id}, document_id={document_id}")
+        return job_id
+
+
+    async def _run_complete_processing(self, job_id: str, document_id: str, db: Session):
+        """
+        Background task: Run extraction + all 4 analyses.
+        """
+        try:
+            logger.info(f"[Job {job_id}] Phase 1: Running OCR extraction...")
+            
+            # Phase 1: Extract text
+            self._update_job_progress(job_id, 10, db)
+            extraction_result = await self.extraction_agent.execute(document_id, db)
+            
+            if not extraction_result.get('success'):
+                raise Exception(f"Extraction failed: {extraction_result.get('error')}")
+            
+            extraction_id = extraction_result['extraction_id']
+            text = extraction_result['text']
+            
+            # Update job with extraction_id
+            job = db.query(OrchestrationJob).filter(OrchestrationJob.id == job_id).first()
+            job.extraction_id = extraction_id
+            db.commit()
+            
+            logger.info(f"[Job {job_id}] Phase 2: Running parallel analyses...")
+            self._update_job_progress(job_id, 30, db)
+            
+            # Phase 2: Run 4 analyses in parallel
+            results = await asyncio.gather(
+                self.ai_detection_service.detect(text),
+                self.horizon_agent.extract_references(text),
+                self.horizon_agent.extract_medical(text),
+                self.horizon_agent.extract_legal(text),
+                return_exceptions=True
+            )
+            
+            ai_detection, references, medical, legal = results
+            
+            # Update job with results
+            job.ai_detection_result = ai_detection if not isinstance(ai_detection, Exception) else {"error": str(ai_detection)}
+            job.references_result = references if not isinstance(references, Exception) else {"error": str(references)}
+            job.medical_result = medical if not isinstance(medical, Exception) else {"error": str(medical)}
+            job.legal_result = legal if not isinstance(legal, Exception) else {"error": str(legal)}
+            job.status = "complete"
+            job.progress = 100
+            job.completed_at = datetime.utcnow()
+            db.commit()
+            
+            logger.info(f"[Job {job_id}] Complete processing finished successfully")
+            
+        except Exception as e:
+            logger.error(f"[Job {job_id}] Complete processing failed: {e}", exc_info=True)
+            
+            # Mark job as failed
+            job = db.query(OrchestrationJob).filter(OrchestrationJob.id == job_id).first()
+            if job:
+                job.status = "failed"
+                job.error_message = str(e)
+                job.completed_at = datetime.utcnow()
+                db.commit()
+    
+    async def _run_full_analysis(self, job_id: str, extraction_id: str, db: Session):
+        """
+        Background task: Run all 4 analyses in parallel
+        """
+        try:
+            # Get extracted text
+            extraction = db.query(Extraction).filter(Extraction.id == extraction_id).first()
+            if not extraction:
+                raise ValueError(f"Extraction {extraction_id} not found")
+            
+            text = extraction.text
+            
+            logger.info(f"Running parallel analyses for job {job_id}")
+            
+            # Update progress
+            self._update_job_progress(job_id, 10, db)
+            
+            # Run 4 analyses in parallel
+            results = await asyncio.gather(
+                self.ai_detection_service.detect(text),
+                self.horizon_agent.extract_references(text),
+                self.horizon_agent.extract_medical(text),
+                self.horizon_agent.extract_legal(text),
+                return_exceptions=True
+            )
+            
+            ai_detection, references, medical, legal = results
+            
+            # Update job with results
+            job = db.query(OrchestrationJob).filter(OrchestrationJob.id == job_id).first()
+            job.ai_detection_result = ai_detection if not isinstance(ai_detection, Exception) else {"error": str(ai_detection)}
+            job.references_result = references if not isinstance(references, Exception) else {"error": str(references)}
+            job.medical_result = medical if not isinstance(medical, Exception) else {"error": str(medical)}
+            job.legal_result = legal if not isinstance(legal, Exception) else {"error": str(legal)}
+            job.status = "complete"
+            job.progress = 100
+            job.completed_at = datetime.utcnow()
+            
+            db.commit()
+            
+            logger.info(f"Orchestrated processing complete: job_id={job_id}")
+            
+        except Exception as e:
+            logger.error(f"Orchestrated processing failed: {e}", exc_info=True)
+            
+            # Mark job as failed
+            job = db.query(OrchestrationJob).filter(OrchestrationJob.id == job_id).first()
+            if job:
+                job.status = "failed"
+                job.error_message = str(e)
+                job.completed_at = datetime.utcnow()
+                db.commit()
+    
+    def _update_job_progress(self, job_id: str, progress: int, db: Session):
+        """Update job progress"""
+        job = db.query(OrchestrationJob).filter(OrchestrationJob.id == job_id).first()
+        if job:
+            job.progress = progress
+            db.commit()
+    
+    def get_job_status(self, job_id: str, db: Session) -> Dict:
+        """
+        Get current job status and results
+        
+        Args:
+            job_id: Job ID to query
+            db: Database session
+            
+        Returns:
+            Dict with status and available results
+        """
+        job = db.query(OrchestrationJob).filter(OrchestrationJob.id == job_id).first()
+        
+        if not job:
+            return {"error": "Job not found"}
+        
+        return {
+            "job_id": job.id,
+            "extraction_id": job.extraction_id,
+            "status": job.status,
+            "progress": job.progress,
+            "ai_detection": job.ai_detection_result,
+            "references": job.references_result,
+            "medical": job.medical_result,
+            "legal": job.legal_result,
+            "started_at": job.started_at.isoformat(),
+            "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+            "error": job.error_message
+        }
