@@ -232,7 +232,7 @@ pytest --cov=app
 
 ### OCR Settings
 - **Tesseract Confidence Threshold**: 60
-- **Tesseract Language**: English (eng) - modify in config
+- **Tesseract Language**: English (eng) - modify in config 
 - **TrOCR Model**: 
   - Printed text: `microsoft/trocr-base-printed`
   - Handwritten: `microsoft/trocr-base-handwritten`
