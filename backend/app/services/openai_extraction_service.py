@@ -163,7 +163,7 @@ class OpenAIExtractionService:
         prompt = f"""You are a medical research expert. Extract ONLY scientific references and online resources from this insurance appeals document.
 
     **EXTRACT THESE (references):**
-    1. Research papers with DOI, PMID, or journal citations
+    1. Research papers with DOI, PMID, or journal citations and papers mentioned under the Reference section
     2. Medical websites and URLs (https://, www.)
     3. Clinical guidelines and protocols
 
@@ -319,7 +319,7 @@ Return JSON with this EXACT structure:
 
 IMPORTANT:
 - Extract all information as-is from the document
-- Do not validate or verify medical information
+- Validate or verify medical information
 - Return ONLY valid JSON, no markdown"""
 
         try:
@@ -424,7 +424,7 @@ Return JSON with this EXACT structure:
 
 IMPORTANT:
 - Extract all information as-is from the document
-- Do not validate or verify legal information
+- Validate or verify legal information
 - Return ONLY valid JSON, no markdown"""
 
         try:

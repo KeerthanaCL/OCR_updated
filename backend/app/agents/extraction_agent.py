@@ -17,7 +17,10 @@ from app.utils.metrics import MetricsCollector
 from app.database import Document, Extraction
 from app.services.storage import StorageService
 from sqlalchemy.orm import Session
+import concurrent.futures
+from functools import partial
 import uuid
+import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +55,7 @@ class LangGraphExtractionAgent:
         """Lazy load TrOCR model (heavy operation)"""
         if self.trocr is None:
             logger.info("Agent loading TrOCR tool...")
-            self.trocr = TrOCRService()
+            self.trocr = TrOCRService(auto_detect=True)
     
     def _build_graph(self) -> StateGraph:
         """Build the LangGraph workflow"""
@@ -181,10 +184,9 @@ class LangGraphExtractionAgent:
                 self._load_trocr()
                 regions = self.region_detector.detect_text_regions(file_path)
                 if regions:
-                    text, metadata = self.trocr.extract_from_regions(file_path, regions)
+                    text, confidence, metadata = self.trocr.extract_from_regions_with_confidence(file_path, regions)
                 else:
-                    text, metadata = self.trocr.extract_text(file_path)
-                confidence = 95.0
+                    text, confidence, metadata = self.trocr.extract_text_with_confidence(file_path)
                 method = 'trocr'
             
             # Update state
@@ -209,7 +211,7 @@ class LangGraphExtractionAgent:
         """Node: Evaluate if result meets quality goals"""
         
         confidence = state.get('confidence', 0)
-        target = state.get('target_confidence', 70.0)
+        target = state.get('target_confidence', 60.0)
         
         if confidence >= target:
             logger.info(f"Target achieved: {confidence:.2f}% >= {target}%")
@@ -354,7 +356,7 @@ class LangGraphExtractionAgent:
                 'processing_time': 0.0,
                 'retry_count': 0,
                 'max_retries': 2,
-                'target_confidence': 70.0,
+                'target_confidence': 60.0,
                 'success': False,
                 'error': None,
                 'metadata': {}
@@ -500,7 +502,7 @@ class LangGraphExtractionAgent:
                     'processing_time': 0.0,
                     'retry_count': 0,
                     'max_retries': 2,
-                    'target_confidence': 75.0,
+                    'target_confidence': 60.0,
                     'success': False,
                     'error': None,
                     'metadata': {}
@@ -556,3 +558,323 @@ class LangGraphExtractionAgent:
             return 'poor'
         else:
             return 'very_poor'
+        
+    async def execute_parallel_best(
+        self, document_id: str, db: Session, **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Execute ALL OCR methods in parallel and select the best result.
+        
+        Strategy: Run Tesseract, EasyOCR, and TrOCR simultaneously for each page,
+        then pick the one with highest confidence.
+        
+        Args:
+            document_id: Document ID to process
+            db: Database session
+            
+        Returns:
+            Dict with best extraction results
+        """
+        metrics = MetricsCollector("extraction_agent_parallel").start()
+        logger.info(f"Starting PARALLEL multi-method extraction for: {document_id}")
+        
+        try:
+            # Get file path
+            storage = StorageService()
+            file_path = storage.get_file_path(document_id)
+            logger.info(f"File path resolved: {file_path}")
+            
+            # Get document
+            document = db.query(Document).filter(Document.id == document_id).first()
+            if not document:
+                raise ValueError(f"Document {document_id} not found")
+            
+            start_time = time.time()
+            
+            # Handle PDF
+            if self._is_pdf(file_path):
+                result = await self._process_pdf_parallel(file_path, document_id, **kwargs)
+            else:
+                result = await self._process_image_parallel(file_path, document_id, **kwargs)
+            
+            # Save to database
+            extraction_id = str(uuid.uuid4())
+            
+            db_extraction = Extraction(
+                id=extraction_id,
+                document_id=document_id,
+                text=result['text'],
+                confidence=float(result['confidence']),
+                method_used=result['method_used'],
+                pages=result['pages'],
+                processing_time=float(result['processing_time']),
+                extraction_metadata=result.get('metadata', {})
+            )
+            
+            db.add(db_extraction)
+            db.commit()
+            db.refresh(db_extraction)
+            
+            logger.info(f"Parallel extraction saved: {extraction_id}, best method: {result['method_used']}")
+            
+            # Add metrics
+            metrics.add_custom_metric('best_method', result['method_used'])
+            metrics.add_custom_metric('confidence', result['confidence'])
+            metrics.add_custom_metric('methods_compared', len(result.get('all_results', [])))
+            
+            final_metrics = metrics.complete(success=True)
+            
+            return {
+                'success': True,
+                'extraction_id': extraction_id,
+                'document_id': document_id,
+                'text': result['text'],
+                'confidence': result['confidence'],
+                'method_used': result['method_used'],
+                'pages': result['pages'],
+                'processing_time': result['processing_time'],
+                'metadata': result.get('metadata', {}),
+                'all_results': result.get('all_results', []),  # All method results for comparison
+                'metrics': final_metrics
+            }
+            
+        except Exception as e:
+            logger.error(f"Parallel extraction failed: {str(e)}", exc_info=True)
+            metrics.record_error(str(e), severity='critical')
+            final_metrics = metrics.complete(success=False)
+            
+            return {
+                'success': False,
+                'extraction_id': None,
+                'error': str(e),
+                'metrics': final_metrics
+            }
+
+
+    async def _process_image_parallel(
+        self, image_path: str, document_id: str, **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Run all 3 OCR methods in parallel for a single image.
+        """
+        start_time = time.time()
+        
+        logger.info(f"Running 3 OCR methods in parallel...")
+        
+        # Load all OCR engines
+        self._load_easyocr()
+        self._load_trocr()
+
+        logger.info("Starting parallel execution:")
+        logger.info("   → Tesseract (region-based)")
+        logger.info("   → EasyOCR")
+        logger.info("   → TrOCR")
+        
+        # Run in thread pool since OCR operations are blocking
+        loop = asyncio.get_event_loop()
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            tasks = [
+                loop.run_in_executor(executor, partial(self._run_tesseract, image_path)),
+                loop.run_in_executor(executor, partial(self._run_easyocr, image_path)),
+                loop.run_in_executor(executor, partial(self._run_trocr, image_path))
+            ]
+            
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        tesseract_result, easyocr_result, trocr_result = results
+        
+        logger.info("All 3 methods completed, analyzing results...")
+        
+        # Collect valid results
+        all_results = []
+        
+        if not isinstance(tesseract_result, Exception):
+            all_results.append({
+                'method': 'tesseract',
+                'text': tesseract_result['text'],
+                'confidence': tesseract_result['confidence'],
+                'metadata': tesseract_result.get('metadata', {})
+            })
+            logger.info(f"Tesseract: {tesseract_result['confidence']:.2f}% confidence")
+        else:
+            logger.error(f"Tesseract failed: {tesseract_result}")
+        
+        if not isinstance(easyocr_result, Exception):
+            all_results.append({
+                'method': 'easyocr',
+                'text': easyocr_result['text'],
+                'confidence': easyocr_result['confidence'],
+                'metadata': easyocr_result.get('metadata', {})
+            })
+            logger.info(f"EasyOCR: {easyocr_result['confidence']:.2f}% confidence")
+        else:
+            logger.error(f"EasyOCR failed: {easyocr_result}")
+        
+        if not isinstance(trocr_result, Exception):
+            all_results.append({
+                'method': 'trocr',
+                'text': trocr_result['text'],
+                'confidence': trocr_result['confidence'],
+                'metadata': trocr_result.get('metadata', {})
+            })
+            logger.info(f"TrOCR: {trocr_result['confidence']:.2f}% confidence")
+        else:
+            logger.error(f"TrOCR failed: {trocr_result}")
+        
+        if not all_results:
+            raise Exception("All OCR methods failed")
+        
+        # Select best result
+        best = self._select_best_result(all_results)
+        
+        logger.info(f"Best method: {best['method']} with {best['confidence']:.2f}% confidence")
+        
+        return {
+            'text': best['text'],
+            'confidence': best['confidence'],
+            'method_used': best['method'],
+            'pages': 1,
+            'processing_time': time.time() - start_time,
+            'metadata': {
+                'selection_strategy': 'highest_confidence',
+                'methods_tried': len(all_results),
+                'all_confidences': {r['method']: r['confidence'] for r in all_results}
+            },
+            'all_results': all_results
+        }
+
+
+    async def _process_pdf_parallel(
+        self, pdf_path: str, document_id: str, **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Process multi-page PDF with parallel method execution per page.
+        """
+        start_time = time.time()
+        
+        # Convert PDF to images
+        output_dir = Path(pdf_path).parent / "temp_images"
+        image_paths = self.pdf_converter.convert(pdf_path, str(output_dir))
+        
+        logger.info(f"PDF converted to {len(image_paths)} pages")
+        
+        try:
+            page_results = []
+            
+            # Process each page with parallel methods
+            for idx, img_path in enumerate(image_paths, 1):
+                logger.info(f"Processing page {idx}/{len(image_paths)} with parallel methods...")
+                
+                page_result = await self._process_image_parallel(img_path, document_id, **kwargs)
+                page_results.append(page_result)
+            
+            # Combine results
+            combined_text = '\n\n'.join(r['text'] for r in page_results)
+            avg_confidence = sum(r['confidence'] for r in page_results) / len(page_results)
+            
+            # Count which method won most often
+            method_wins = {}
+            for r in page_results:
+                method = r['method_used']
+                method_wins[method] = method_wins.get(method, 0) + 1
+            
+            best_overall_method = max(method_wins, key=method_wins.get)
+            
+            logger.info(f"Method wins: {method_wins}, Overall best: {best_overall_method}")
+            
+            return {
+                'text': combined_text,
+                'confidence': avg_confidence,
+                'method_used': f'parallel-best ({best_overall_method} won {method_wins[best_overall_method]}/{len(page_results)} pages)',
+                'pages': len(image_paths),
+                'processing_time': time.time() - start_time,
+                'metadata': {
+                    'method_wins': method_wins,
+                    'page_results': page_results
+                },
+                'all_results': page_results
+            }
+            
+        finally:
+            self._cleanup_temp_images(output_dir)
+
+
+    def _select_best_result(self, results: List[Dict]) -> Dict:
+        """
+        Select the best OCR result based on confidence and text quality.
+        
+        Selection criteria (in order):
+        1. Highest confidence
+        2. If confidence is close (within 5%), prefer longest text
+        3. Prefer Tesseract/EasyOCR over TrOCR (faster for same quality)
+        """
+        if len(results) == 1:
+            return results[0]
+        
+        # Sort by confidence (descending)
+        sorted_results = sorted(results, key=lambda r: r['confidence'], reverse=True)
+        
+        best = sorted_results[0]
+        runner_up = sorted_results[1] if len(sorted_results) > 1 else None
+        
+        # If confidence is very close (within 5%), prefer longer text
+        if runner_up and abs(best['confidence'] - runner_up['confidence']) < 5.0:
+            best_len = len(best['text'])
+            runner_len = len(runner_up['text'])
+            
+            if runner_len > best_len * 1.1:  # Runner-up has 10% more text
+                logger.info(
+                    f"Choosing {runner_up['method']} over {best['method']} "
+                    f"(similar confidence but more text: {runner_len} vs {best_len})"
+                )
+                return runner_up
+        
+        return best
+
+
+    def _run_tesseract(self, image_path: str) -> Dict:
+        """Run Tesseract OCR"""
+        try:
+            text, confidence, metadata = self.tesseract.extract_text_region_based(image_path)
+            logger.info(f"Tesseract: Completed with {confidence:.2f}% confidence")
+            return {
+                'text': text,
+                'confidence': confidence,
+                'metadata': metadata
+            }
+        except Exception as e:
+            raise Exception(f"Tesseract failed: {str(e)}")
+
+
+    def _run_easyocr(self, image_path: str) -> Dict:
+        """Run EasyOCR"""
+        try:
+            text, confidence, metadata = self.easyocr.extract_text(image_path)
+            logger.info(f"EasyOCR: Completed with {confidence:.2f}% confidence")
+            return {
+                'text': text,
+                'confidence': confidence,
+                'metadata': metadata
+            }
+        except Exception as e:
+            raise Exception(f"EasyOCR failed: {str(e)}")
+
+
+    def _run_trocr(self, image_path: str) -> Dict:
+        """Run TrOCR"""
+        try:
+            regions = self.region_detector.detect_text_regions(image_path)
+            if regions:
+                text, confidence, metadata = self.trocr.extract_from_regions_with_confidence(image_path, regions)
+            else:
+                text, confidence, metadata = self.trocr.extract_text_with_confidence(image_path)
+
+            logger.info(f"TrOCR: Completed with {confidence:.2f}% confidence")
+            return {
+                'text': text,
+                'confidence': confidence,  # TrOCR doesn't provide confidence, assume high
+                'metadata': metadata
+            }
+        except Exception as e:
+            raise Exception(f"TrOCR failed: {str(e)}")

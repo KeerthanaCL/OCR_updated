@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 from app.config import get_settings
-from app.api import upload, extract, monitoring
+from app.api import upload, extract, monitoring, extract_parallel
 from app.api import analysis, orchestration
 
 # Configure logging
@@ -40,6 +40,7 @@ async def startup_event():
 # Include routers
 app.include_router(upload.router)
 app.include_router(extract.router)
+app.include_router(extract_parallel.router)
 app.include_router(analysis.router)
 app.include_router(orchestration.router)
 app.include_router(monitoring.router)  
