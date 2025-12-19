@@ -50,7 +50,7 @@ class HorizonAgent:
                 "is_validated": is_validated,  # Clear boolean flag
                 "validation_status": validation_status,  # "validated", "partial", "failed"
                 "data": {
-                    "research_papers": [r.dict() for r in result.research_papers],
+                    "research_papers": [r.dict() for r in result.research_papers], 
                     "online_resources": [r.dict() for r in result.online_resources],
                     "summary": result.summary,
                     "total_count": len(result.research_papers) + len(result.online_resources)
