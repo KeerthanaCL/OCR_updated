@@ -26,6 +26,10 @@ class JobStatusEnum(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
 
+class TextUpload(BaseModel):
+    """Model for uploading text documents"""
+    content: str  
+
 class UploadResponse(BaseModel):
     """Response model for document upload"""
     document_id: str

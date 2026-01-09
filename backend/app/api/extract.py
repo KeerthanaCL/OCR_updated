@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
 from app.models import (
-    ExtractionRequest, 
+    ExtractionRequest,
     DocumentStatus,
     OCRMethod
 )
@@ -10,10 +10,36 @@ from app.services.storage import StorageService
 from app.database import get_db, Document, Extraction
 from pathlib import Path
 import numpy as np
-import uuid
 import logging
+import re
 
 logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/v1", tags=["extraction"])
+
+# Global orchestrator instance
+orchestrator = OrchestratorAgent()
+
+
+def sanitize_sensitive_info(text: str) -> str:
+    """
+    Remove sensitive information from text using regex patterns.
+    """
+    if not text:
+        return text
+
+    dob_pattern1 = r'\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b'
+    dob_pattern2 = r'\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b'
+    dob_pattern3 = r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}\b'
+    ssn_pattern = r'\b\d{3}-\d{2}-\d{4}\b'
+
+    text = re.sub(dob_pattern1, '<D.O.B>', text, flags=re.IGNORECASE)
+    text = re.sub(dob_pattern2, '<D.O.B>', text, flags=re.IGNORECASE)
+    text = re.sub(dob_pattern3, '<D.O.B>', text, flags=re.IGNORECASE)
+    text = re.sub(ssn_pattern, '<S.S.N>', text)
+
+    return text
+
 
 def convert_numpy_types(obj):
     """Convert numpy types to native Python types for JSON serialization"""
@@ -29,10 +55,6 @@ def convert_numpy_types(obj):
         return [convert_numpy_types(item) for item in obj]
     return obj
 
-router = APIRouter(prefix="/api/v1", tags=["extraction"])
-
-# Global orchestrator instance
-orchestrator = OrchestratorAgent()
 
 @router.post("/extract")
 async def extract_document(
@@ -40,72 +62,91 @@ async def extract_document(
     db: Session = Depends(get_db)
 ):
     """
-    Extract text from uploaded document (Page 1)
-    
-    This endpoint only performs OCR extraction.
-    For analysis, use either:
-    - Approach 1: Individual endpoints (/ai-detection, /horizon/*)
-    - Approach 2: Orchestrated processing (/process, /status)
+    Extract text from uploaded document.
+
+    - If extraction already exists (paste-text case), return immediately
+    - Otherwise perform OCR extraction
     """
     try:
-        # Step 1: Get document from database
+        # Step 1: Fetch document
         document = db.query(Document).filter(Document.id == request.document_id).first()
         if not document:
             raise HTTPException(status_code=404, detail="Document not found")
-        
-        # Update document status
+
+        # ✅ STEP 1.5 — SHORT CIRCUIT FOR PASTED TEXT
+        existing_extraction = db.query(Extraction).filter(
+            Extraction.document_id == request.document_id
+        ).first()
+
+        if existing_extraction:
+            logger.info(
+                f"Skipping OCR — extraction already exists for document {request.document_id}"
+            )
+
+            return {
+                'success': True,
+                'document_id': request.document_id,
+                'extraction_id': existing_extraction.id,
+                'text': sanitize_sensitive_info(existing_extraction.text or ''),
+                'confidence': float(existing_extraction.confidence or 1.0),
+                'method_used': existing_extraction.method_used,
+                'pages': existing_extraction.pages or 1,
+                'processing_time': 0.0,
+                'metadata': existing_extraction.extraction_metadata or {}
+            }
+
+        # Step 2: Update document status
         document.status = DocumentStatus.EXTRACTING.value
         db.commit()
-        
-        # Step 2: Get file path
+
+        # Step 3: Get file path
         storage = StorageService()
         file_path = storage.get_file_path(request.document_id)
-        
-        logger.info(f"Processing document: {document.filename} (ID: {request.document_id})")
-        
-        # Step 3: Execute complete processing pipeline via orchestrator
+
+        logger.info(f"Processing document via OCR: {document.filename} ({request.document_id})")
+
+        # Step 4: Run OCR extraction
         result = await orchestrator.extract_only(
             document_id=request.document_id,
             db=db
         )
-        
+
         if not result.get('success'):
             document.status = DocumentStatus.FAILED.value
             db.commit()
             raise HTTPException(
-                status_code=500, 
-                detail=result.get('error', 'Processing failed')
+                status_code=500,
+                detail=result.get('error', 'Extraction failed')
             )
-        
+
         extraction_id = result['extraction_id']
 
-        # Step 3: Update document status
+        # Step 5: Update document status
         document.status = DocumentStatus.COMPLETED.value
         db.commit()
 
         logger.info(f"Document extraction completed: {extraction_id}")
 
-        # Step 4: Return extraction result
+        # Step 6: Fetch extraction
         extraction = db.query(Extraction).filter(Extraction.id == extraction_id).first()
-
         if not extraction:
             raise HTTPException(
                 status_code=500,
-                detail=f"Extraction record not found in database for ID: {extraction_id}"
+                detail=f"Extraction record not found for ID: {extraction_id}"
             )
-        
+
         return {
             'success': True,
             'document_id': request.document_id,
             'extraction_id': extraction_id,
-            'text': extraction.text or '',
+            'text': sanitize_sensitive_info(extraction.text or ''),
             'confidence': float(extraction.confidence or 0.0),
             'method_used': extraction.method_used or 'unknown',
             'pages': extraction.pages or 0,
             'processing_time': float(extraction.processing_time or 0.0),
             'metadata': extraction.extraction_metadata or {}
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -117,7 +158,10 @@ async def extract_document(
 
 
 @router.get("/extract/status/{document_id}")
-async def get_extraction_status(document_id: str, db: Session = Depends(get_db)):
+async def get_extraction_status(
+    document_id: str,
+    db: Session = Depends(get_db)
+):
     """Get extraction status for a document."""
     document = db.query(Document).filter(Document.id == document_id).first()
     if not document:
