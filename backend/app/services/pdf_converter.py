@@ -15,7 +15,7 @@ class PDFConverter:
     Supports two methods: pdf2image (Poppler) and PyMuPDF (fitz).
     """
     
-    def __init__(self, method: str = "pymupdf"):
+    def __init__(self, method: str = "pymupdf", save_images: bool = True):
         """
         Initialize PDF converter.
         
@@ -24,6 +24,7 @@ class PDFConverter:
         """
         self.method = method
         self.dpi = 300  # Standard DPI for OCR (300-400 recommended)
+        self.save_images = save_images 
         
     def convert_with_pymupdf(
         self, 
@@ -57,6 +58,7 @@ class PDFConverter:
             mat = fitz.Matrix(zoom, zoom)
             
             logger.info(f"Converting PDF with {len(doc)} pages at {self.dpi} DPI")
+            logger.info(f"Images will be saved to: {output_path}")
             
             # Process each page
             for page_num, page in enumerate(doc, start=1):

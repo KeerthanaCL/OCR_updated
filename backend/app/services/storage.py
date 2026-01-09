@@ -37,10 +37,24 @@ class StorageService:
         file_path = doc_dir / file.filename
         
         file_size = 0
+
+        # Use smaller chunk size (1MB, not 100MB)
+        chunk_size = 1024 * 1024  # 1MB chunks
+
         async with aiofiles.open(file_path, 'wb') as f:
-            while chunk := await file.read(1024 * 1024):  # Read 1MB chunks
+            while chunk := await file.read(chunk_size):  # Read 1MB chunks
                 await f.write(chunk)
                 file_size += len(chunk)
+
+                # Check size limit during upload
+                if file_size > settings.max_file_size:
+                    # Delete partial file
+                    await f.close()
+                    os.remove(file_path)
+                    raise ValueError(
+                        f"File exceeds maximum size of "
+                        f"{settings.max_file_size // (1024*1024)}MB"
+                    )
         
         return document_id, str(file_path), file_size
     

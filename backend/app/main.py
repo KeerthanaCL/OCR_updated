@@ -1,9 +1,11 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 import logging
 from app.config import get_settings
-from app.api import upload, extract, monitoring, extract_parallel
-from app.api import analysis, orchestration
+from app.api import upload, extract, monitoring
+from app.api import analysis, orchestration, paddleocr_test
 
 # Configure logging
 logging.basicConfig(
@@ -14,12 +16,39 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
+class LargeFileMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Allow large uploads for specific routes
+        if request.url.path.startswith("/api/v1/upload"):
+            # Check Content-Length header
+            content_length = request.headers.get("content-length")
+            if content_length:
+                content_length = int(content_length)
+                
+                # ADD DEBUG LOGGING
+                logger.info(f"📦 Upload request: {content_length / (1024*1024):.2f}MB")
+                logger.info(f"📊 Max allowed: {settings.max_file_size / (1024*1024):.2f}MB")
+                
+                if content_length > settings.max_file_size:
+                    logger.warning(f"❌ File rejected: {content_length / (1024*1024):.2f}MB > {settings.max_file_size / (1024*1024):.2f}MB")
+                    return JSONResponse(
+                        status_code=413,
+                        content={
+                            "detail": f"File too large. Max size: {settings.max_file_size // (1024*1024)}MB"
+                        }
+                    )
+        
+        response = await call_next(request)
+        return response
+
 # Create FastAPI app
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
     description="Intelligent document extraction API with OCR and parsing capabilities"
 )
+
+app.add_middleware(LargeFileMiddleware)  # File size check first
 
 # Add CORS middleware
 app.add_middleware(
@@ -35,15 +64,22 @@ app.add_middleware(
 async def startup_event():
     """Initialize services on startup"""
     logger.info("Starting OCR AI Detection API...")
+    logger.info(f"Config max_file_size (raw): {settings.max_file_size}")
+    logger.info(f"Config max_file_size (MB): {settings.max_file_size / (1024*1024):.2f}MB")
+    logger.info(f"Config upload_dir: {settings.upload_dir}")
+    
+    logger.info(f"Max Upload Size: {settings.max_file_size // (1024*1024)}MB")
+    logger.info(f"OCR Strategy: Tesseract → AWS Textract Fallback")
+    logger.info(f"Textract Fallback Threshold: {settings.textract_fallback_threshold}%")
     logger.info("API Ready")
 
 # Include routers
 app.include_router(upload.router)
 app.include_router(extract.router)
-app.include_router(extract_parallel.router)
 app.include_router(analysis.router)
 app.include_router(orchestration.router)
 app.include_router(monitoring.router)  
+app.include_router(paddleocr_test.router)
 
 @app.get("/")
 async def root():
@@ -52,7 +88,13 @@ async def root():
         "name": settings.app_name,
         "version": settings.app_version,
         "status": "running",
-        "approaches": {
+        "max_upload_size_mb": settings.max_file_size // (1024*1024),
+        "ocr_strategy": {
+            "primary": "Tesseract (FREE, fast)",
+            "fallback": "AWS Textract (PAID, accurate)",
+            "threshold": f"{settings.textract_fallback_threshold}%"
+        },
+        "api_approaches": {
             "approach_1": "Individual endpoints (/ai-detection, /horizon/*)",
             "approach_2": "Orchestrated processing (/process, /status)"
         }
@@ -69,5 +111,7 @@ if __name__ == "__main__":
         "app.main:app",
         host="0.0.0.0",
         port=8000,
-        reload=settings.debug
+        reload=settings.debug,
+        timeout_keep_alive=300,
+        limit_concurrency=10
     )

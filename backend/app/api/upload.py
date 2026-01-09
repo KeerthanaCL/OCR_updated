@@ -36,13 +36,13 @@ async def upload_document(
         storage = StorageService()
         document_id, file_path, file_size = await storage.save_upload_file(file)
         
-        # Check file size
-        if file_size > settings.max_file_size:
-            storage.delete_document(document_id)
-            raise HTTPException(
-                status_code=400,
-                detail=f"File too large. Max size: {settings.max_file_size / (1024*1024):.1f} MB"
-            )
+        # # Check file size
+        # if file_size > settings.max_file_size:
+        #     storage.delete_document(document_id)
+        #     raise HTTPException(
+        #         status_code=400,
+        #         detail=f"File too large. Max size: {settings.max_file_size / (1024*1024):.1f} MB"
+        #     )
         
         # Save to database
         db_document = Document(
@@ -55,6 +55,7 @@ async def upload_document(
         db.add(db_document)
         db.commit()
         
+        logger.info(f"Uploaded: {file.filename} ({file_size/(1024*1024):.2f}MB)")
         logger.info(f"Document uploaded: {document_id} ({file.filename})")
         
         return UploadResponse(
