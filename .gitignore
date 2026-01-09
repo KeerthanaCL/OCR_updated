@@ -21,3 +21,4 @@ backend/uploads/
 venv/
 
 backend/app/config.py
+.github/copilot-instructions.md

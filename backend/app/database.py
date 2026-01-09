@@ -21,7 +21,7 @@ class Document(Base):
     
     id = Column(String, primary_key=True, index=True)
     filename = Column(String, nullable=False)
-    file_path = Column(String, nullable=False)
+    file_path = Column(String, nullable=True)
     file_size = Column(Integer)
     status = Column(String, default="uploaded")
     created_at = Column(DateTime, default=datetime.utcnow)
