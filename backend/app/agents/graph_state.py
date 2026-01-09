@@ -9,14 +9,11 @@ class ExtractionState(TypedDict):
     file_path: str
     document_id: str
     use_preprocessing: bool
-    force_trocr: bool
     correct_orientation: bool
     
     # Document Analysis
     doc_analysis: Optional[Dict[str, Any]]
     
-    # Extraction Strategy
-    chosen_strategy: Optional[str]
     attempted_methods: Annotated[List[str], add]  # Accumulates methods tried
     
     # Current Result
@@ -24,11 +21,9 @@ class ExtractionState(TypedDict):
     confidence: float
     method_used: Optional[str]
     processing_time: float
-    
-    # Agent State
-    retry_count: int
-    max_retries: int
-    target_confidence: float
+
+    # Fallback Control
+    needs_fallback: bool 
     
     # Final Output
     success: bool

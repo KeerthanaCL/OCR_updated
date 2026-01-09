@@ -7,7 +7,7 @@ import cv2
 import os
 import shutil
 from app.config import get_settings
-from app.services.preprocessing import ImagePreprocessor
+from app.services.preprocessing import AdvancedImagePreprocessor
 from app.services.region_detector import RegionDetector
 
 logger = logging.getLogger(__name__)
@@ -21,7 +21,7 @@ class TesseractService:
     
     def __init__(self):
         self.confidence_threshold = settings.tesseract_confidence_threshold
-        self.preprocessor = ImagePreprocessor()
+        self.preprocessor = AdvancedImagePreprocessor(enable_super_resolution=True)
         self.region_detector = RegionDetector()
         
         # Try to find Tesseract executable
@@ -270,7 +270,9 @@ class TesseractService:
 
             # Read image using OpenCV (more reliable than PIL)
             if preprocess:
-                pil_image = self.preprocessor.preprocess_for_ocr(image_path)
+                pil_image = self.preprocessor.preprocess_for_ocr(image_path,
+                                                                 aggressive=False,  # Set to True for very poor quality
+                                                                 enhance_quality=True)
                 # Convert PIL to OpenCV format
                 image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
             else:

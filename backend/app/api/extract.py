@@ -8,6 +8,7 @@ from app.models import (
 from app.agents.orchestrator_agent import OrchestratorAgent
 from app.services.storage import StorageService
 from app.database import get_db, Document, Extraction
+from pathlib import Path
 import numpy as np
 import uuid
 import logging
@@ -145,3 +146,108 @@ async def get_extraction_status(document_id: str, db: Session = Depends(get_db))
         }
 
     return response
+
+@router.get("/pdf-pages/{document_id}")
+async def get_pdf_pages(
+    document_id: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Get list of converted PDF page images for a document.
+    Useful for debugging and visual inspection.
+    
+    Returns:
+        List of page image paths with metadata
+    """
+    try:
+        # Get document
+        document = db.query(Document).filter(Document.id == document_id).first()
+        if not document:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        # Check if it's a PDF
+        if not document.filename.lower().endswith('.pdf'):
+            raise HTTPException(status_code=400, detail="Document is not a PDF")
+        
+        # Get PDF pages directory
+        storage = StorageService()
+        document_dir = Path(storage.get_file_path(document_id)).parent
+        pdf_pages_dir = document_dir / "pdf_pages"
+        
+        if not pdf_pages_dir.exists():
+            return {
+                "document_id": document_id,
+                "filename": document.filename,
+                "pages": [],
+                "message": "PDF pages not yet converted"
+            }
+        
+        # List all page images
+        page_images = sorted(pdf_pages_dir.glob("page_*.png"))
+        
+        pages = []
+        for idx, page_path in enumerate(page_images, start=1):
+            # Get image info
+            img_size = page_path.stat().st_size
+            
+            pages.append({
+                "page_number": idx,
+                "filename": page_path.name,
+                "path": str(page_path),
+                "size_bytes": img_size,
+                "size_mb": round(img_size / (1024 * 1024), 2)
+            })
+        
+        return {
+            "document_id": document_id,
+            "filename": document.filename,
+            "total_pages": len(pages),
+            "pages_directory": str(pdf_pages_dir),
+            "pages": pages
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get PDF pages: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.delete("/pdf-pages/{document_id}")
+async def delete_pdf_pages(
+    document_id: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Delete converted PDF page images to save disk space.
+    Original PDF is kept.
+    """
+    try:
+        import shutil
+        
+        storage = StorageService()
+        document_dir = Path(storage.get_file_path(document_id)).parent
+        pdf_pages_dir = document_dir / "pdf_pages"
+        
+        if not pdf_pages_dir.exists():
+            return {
+                "success": True,
+                "message": "No PDF pages to delete"
+            }
+        
+        # Count files before deletion
+        page_count = len(list(pdf_pages_dir.glob("page_*.png")))
+        
+        # Delete directory
+        shutil.rmtree(pdf_pages_dir)
+        
+        logger.info(f"Deleted {page_count} PDF page images for document {document_id}")
+        
+        return {
+            "success": True,
+            "message": f"Deleted {page_count} PDF page images",
+            "document_id": document_id
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to delete PDF pages: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))

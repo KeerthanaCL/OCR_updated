@@ -6,9 +6,9 @@ from enum import Enum
 class OCRMethod(str, Enum):
     """OCR methods used for extraction"""
     TESSERACT = "tesseract"
-    TROCR = "trocr"
-    EASYOCR = "easyocr"
-    HYBRID = "hybrid"
+    AWS_TEXTRACT = "aws_textract"
+    TESSERACT_TEXTRACT_FALLBACK = "tesseract_textract_fallback"  # Most common
+    PADDLEOCR = "paddleocr"  # Optional (for testing)
 
 class DocumentStatus(str, Enum):
     """Document processing status"""
@@ -38,7 +38,6 @@ class ExtractionRequest(BaseModel):
     """Request model for text extraction"""
     document_id: str
     use_preprocessing: bool = True
-    force_trocr: bool = False
 
 class ExtractionResult(BaseModel):
     """Result model for text extraction"""
