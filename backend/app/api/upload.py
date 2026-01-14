@@ -4,6 +4,7 @@ from app.models import UploadResponse, DocumentStatus
 from app.services.storage import StorageService
 from app.database import get_db, Document
 from app.config import get_settings
+from app.utils import cancellation_manager
 import logging
 
 logger = logging.getLogger(__name__)
@@ -15,6 +16,13 @@ async def upload_document(
     file: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
+        # STEP 3: Block future requests if cancelled
+    if not cancellation_manager.accept_requests:
+        raise HTTPException(
+            status_code=503,
+            detail="Processing has been cancelled by user"
+        )
+
     """
     Upload a document for processing.
     

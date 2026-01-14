@@ -10,6 +10,8 @@ from app.database import get_db, Document, Extraction
 from app.models import ProcessRequest, ProcessResponse, JobStatusResponse
 from app.agents.orchestrator_agent import OrchestratorAgent
 from datetime import datetime
+from app.utils import cancellation_manager
+import asyncio
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["orchestration"])
@@ -23,6 +25,13 @@ async def start_orchestrated_processing(
     request: ProcessRequest,
     db: Session = Depends(get_db)
 ):
+        # STEP 3: Block future requests if cancelled
+    if not cancellation_manager.accept_requests:
+        raise HTTPException(
+            status_code=503,
+            detail="Processing has been cancelled by user"
+        )
+
     """
     Start complete document processing in background
     

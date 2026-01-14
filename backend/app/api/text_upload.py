@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 import uuid
 import logging
 
+from app.utils import cancellation_manager
 from app.database import get_db, Document, Extraction
 from app.models import UploadResponse, DocumentStatus
 
@@ -20,6 +21,13 @@ async def upload_text(
     payload: TextUpload,
     db: Session = Depends(get_db)
 ):
+        # STEP 3: Block future requests if cancelled
+    if not cancellation_manager.accept_requests:
+        raise HTTPException(
+            status_code=503,
+            detail="Processing has been cancelled by user"
+        )
+
     try:
         text = payload.content.strip()
         if not text:

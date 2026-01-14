@@ -5,6 +5,8 @@ from pathlib import Path
 import cv2
 
 from langgraph.graph import StateGraph, END
+import asyncio
+from app.utils import cancellation_manager
 
 from app.agents.graph_state import ExtractionState
 from app.services.tesseract_service import TesseractService
@@ -22,6 +24,10 @@ import uuid
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
+def _check_cancel():
+    if cancellation_manager.cancel_event.is_set():
+        raise asyncio.CancelledError()
+        
 class LangGraphExtractionAgent:
     """
     LangGraph-based extraction agent with Tesseract → AWS Textract fallback.
@@ -40,6 +46,7 @@ class LangGraphExtractionAgent:
     - AWS Textract: $0.0015/page (only for difficult cases)
     - Expected savings: 80-90% vs using Textract for everything
     """
+
     
     def __init__(self):
         self.tesseract = TesseractService()
@@ -95,6 +102,7 @@ class LangGraphExtractionAgent:
     
     def _analyze_document_node(self, state: ExtractionState) -> ExtractionState:
         """Node: Analyze document characteristics"""
+        _check_cancel()
         logger.info("Analyzing document...")
         
         try:
@@ -126,6 +134,10 @@ class LangGraphExtractionAgent:
                 f"blur_score={blur_score:.2f}"
             )
             
+        except asyncio.CancelledError:
+            logger.warning("Extraction cancelled")
+            raise
+        
         except Exception as e:
             logger.error(f"Analysis failed: {e}")
             state['doc_analysis'] = {'analysis_failed': True}
@@ -134,6 +146,7 @@ class LangGraphExtractionAgent:
     
     def _extract_tesseract_node(self, state: ExtractionState) -> ExtractionState:
         """Node: Extract text using Tesseract"""
+        _check_cancel()
         file_path = state['file_path']
         start_time = time.time()
         
@@ -142,6 +155,7 @@ class LangGraphExtractionAgent:
         try:
             # Correct orientation if needed
             if state.get('correct_orientation'):
+                _check_cancel()
                 orientation_result = self._correct_image_orientation(file_path)
                 file_path = orientation_result['path']
                 state['file_path'] = file_path
@@ -152,6 +166,7 @@ class LangGraphExtractionAgent:
                 file_path,
                 preprocess=state.get('use_preprocessing', True)
             )
+            _check_cancel()
             
             # Update state
             state['extracted_text'] = text
@@ -166,6 +181,10 @@ class LangGraphExtractionAgent:
                 f"words={len(text.split())}, time={state['processing_time']:.2f}s"
             )
             
+        except asyncio.CancelledError:
+            logger.warning("Extraction cancelled")
+            raise
+
         except Exception as e:
             logger.error(f"Tesseract extraction failed: {e}")
             state['error'] = str(e)
@@ -207,6 +226,7 @@ class LangGraphExtractionAgent:
     
     def _fallback_textract_node(self, state: ExtractionState) -> ExtractionState:
         """Node: Fallback to AWS Textract for better accuracy"""
+        _check_cancel()
         file_path = state['file_path']
         start_time = time.time()
         tesseract_confidence = state.get('confidence', 0)
@@ -223,6 +243,7 @@ class LangGraphExtractionAgent:
             else:
                 logger.info("Using AWS Textract (basic text extraction)")
                 text, confidence, metadata = self.aws_textract.extract_text(file_path)
+            _check_cancel()
             
             # Update state with Textract result
             improvement = confidence - tesseract_confidence
@@ -245,6 +266,10 @@ class LangGraphExtractionAgent:
                 f"improvement={improvement:+.2f}%"
             )
             
+        except asyncio.CancelledError:
+            logger.warning("Extraction cancelled")
+            raise
+        
         except Exception as e:
             logger.error(f"AWS Textract fallback failed: {e}")
             # Keep Tesseract result even if Textract fails
@@ -270,7 +295,12 @@ class LangGraphExtractionAgent:
                 return {'path': corrected_path, 'info': orientation_info}
             
             return {'path': image_path, 'info': orientation_info}
-            
+
+        
+        except asyncio.CancelledError:
+            logger.warning("Extraction cancelled")
+            raise
+
         except Exception as e:
             logger.warning(f"Orientation correction failed: {str(e)}, using original")
             return {'path': image_path, 'info': {'was_corrected': False, 'error': str(e)}}
@@ -297,9 +327,14 @@ class LangGraphExtractionAgent:
         logger.info(f"Starting LangGraph extraction for: {document_id}")
     
         try:
+            
+            _check_cancel()
+            
             storage = StorageService()
             file_path = storage.get_file_path(document_id)
             logger.info(f"File path resolved: {file_path}")
+            
+            _check_cancel()
             
             # Get document from database
             document = db.query(Document).filter(Document.id == document_id).first()
@@ -346,6 +381,10 @@ class LangGraphExtractionAgent:
                 'metrics': final_metrics
             }
             
+        except asyncio.CancelledError:
+            logger.warning("Extraction cancelled")
+            raise
+        
         except Exception as e:
             logger.error(f"Extraction failed with exception: {e}", exc_info=True)
             metrics.record_error(str(e), severity='critical')
@@ -379,7 +418,9 @@ class LangGraphExtractionAgent:
         storage = StorageService()
         document_dir = Path(storage.get_file_path(document_id)).parent
         output_dir = document_dir / "pdf_pages"  # Save in document folder
+        _check_cancel()
         image_paths = self.pdf_converter.convert(pdf_path, str(output_dir))
+        _check_cancel()
         logger.info(f"PDF converted to {len(image_paths)} pages")
         
         try:
@@ -388,6 +429,7 @@ class LangGraphExtractionAgent:
             # Process each page through the graph
             for idx, img_path in enumerate(image_paths, 1):
                 logger.info(f"Processing page {idx}/{len(image_paths)}")
+                _check_cancel()
                 
                 # Create state for this page
                 page_state: ExtractionState = {
@@ -443,6 +485,11 @@ class LangGraphExtractionAgent:
         
         # finally:
         #     self._cleanup_temp_images(output_dir)
+        
+        except asyncio.CancelledError:
+            logger.warning("Extraction cancelled")
+            raise
+
         except Exception as e:
             logger.error(f"PDF processing failed: {e}", exc_info=True)
             raise

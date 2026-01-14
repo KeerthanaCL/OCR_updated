@@ -11,6 +11,7 @@ from app.database import get_db, Document, Extraction
 from pathlib import Path
 import numpy as np
 import logging
+from app.utils import cancellation_manager
 import re
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,13 @@ async def extract_document(
     request: ExtractionRequest,
     db: Session = Depends(get_db)
 ):
+        # STEP 3: Block future requests if cancelled
+    if not cancellation_manager.accept_requests:
+        raise HTTPException(
+            status_code=503,
+            detail="Processing has been cancelled by user"
+        )
+
     """
     Extract text from uploaded document.
 
