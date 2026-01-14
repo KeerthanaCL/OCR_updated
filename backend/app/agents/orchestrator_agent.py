@@ -8,6 +8,7 @@ import uuid
 from datetime import datetime
 from typing import Dict, Any
 from sqlalchemy.orm import Session
+from app.utils import cancellation_manager
 
 from app.agents.extraction_agent import LangGraphExtractionAgent
 from app.agents.horizon_agent import HorizonAgent
@@ -87,19 +88,8 @@ class OrchestratorAgent:
             }
     
     async def process_full_analysis(self, extraction_id: str, db: Session) -> str:
-        """
-        Phase 2: Start full analysis (AI Detection + Horizon) in background
-        
-        Args:
-            extraction_id: ID of extracted text
-            db: Database session
-            
-        Returns:
-            job_id for tracking
-        """
-        # Create job record
         job_id = str(uuid.uuid4())
-        
+
         job = OrchestrationJob(
             id=job_id,
             extraction_id=extraction_id,
@@ -109,52 +99,72 @@ class OrchestratorAgent:
         )
         db.add(job)
         db.commit()
-        
-        # Start background processing (don't await)
-        asyncio.create_task(self._run_full_analysis(job_id, extraction_id, db))
-        
+
+        async def pipeline():
+            try:
+                if cancellation_manager.cancel_event.is_set():
+                    raise asyncio.CancelledError()
+
+                await self._run_full_analysis(job_id, extraction_id, db)
+
+            except asyncio.CancelledError:
+                logger.warning(f"[CANCELLED] Job {job_id} (analysis)")
+                self._mark_job_cancelled(job_id, db)
+                raise
+
+            finally:
+                await cancellation_manager.unregister(job_id)
+
+        task = asyncio.create_task(pipeline())
+        await cancellation_manager.register(job_id, task)
+
         logger.info(f"Started orchestrated processing: job_id={job_id}")
-        
         return job_id
+
     
     async def process_complete(self, document_id: str, db: Session) -> str:
-        """
-        Complete processing: Extraction + All Analyses in one job.
-        
-        Args:
-            document_id: Document ID to process
-            db: Database session
-            
-        Returns:
-            job_id for tracking
-        """
-        import uuid
-        from datetime import datetime
-        from app.database import OrchestrationJob
-        
-        # Create job record
         job_id = str(uuid.uuid4())
+
         job = OrchestrationJob(
             id=job_id,
-            extraction_id="pending",  # Will be updated after extraction
+            extraction_id="pending",
             status="processing",
             progress=0,
             started_at=datetime.utcnow()
         )
         db.add(job)
         db.commit()
-        
-        # Start background processing (extraction + analyses)
-        asyncio.create_task(self._run_complete_processing(job_id, document_id, db))
-        
-        logger.info(f"Started complete processing: job_id={job_id}, document_id={document_id}")
+
+        async def pipeline():
+            try:
+                if cancellation_manager.cancel_event.is_set():
+                    raise asyncio.CancelledError()
+
+                await self._run_complete_processing(job_id, document_id, db)
+
+            except asyncio.CancelledError:
+                logger.warning(f"[CANCELLED] Job {job_id} (complete)")
+                self._mark_job_cancelled(job_id, db)
+                raise
+
+            finally:
+                await cancellation_manager.unregister(job_id)
+
+        task = asyncio.create_task(pipeline())
+        await cancellation_manager.register(job_id, task)
+
+        logger.info(f"Started complete processing: job_id={job_id}")
         return job_id
+
 
 
     async def _run_complete_processing(self, job_id: str, document_id: str, db: Session):
         """
         Background task: Run extraction + all 4 analyses.
         """
+        if cancellation_manager.cancel_event.is_set():
+            raise asyncio.CancelledError()
+
         try:
             logger.info(f"[Job {job_id}] Phase 1: Running OCR extraction...")
             
@@ -176,6 +186,9 @@ class OrchestratorAgent:
             logger.info(f"[Job {job_id}] Phase 2: Running parallel analyses...")
             self._update_job_progress(job_id, 30, db)
 
+            if cancellation_manager.cancel_event.is_set():
+                raise asyncio.CancelledError()
+
             # Wrap AI detection to handle service unavailability
             async def safe_ai_detection():
                 try:
@@ -184,6 +197,9 @@ class OrchestratorAgent:
                     logger.warning(f"[Job {job_id}] AI Detection service unavailable: {e}")
                     return {"success": False, "error": f"Service unavailable: {str(e)}", "data": None}
             
+            if cancellation_manager.cancel_event.is_set():
+                raise asyncio.CancelledError()
+
             # Phase 2: Run 4 analyses in parallel
             results = await asyncio.gather(
                 safe_ai_detection(),
@@ -237,6 +253,9 @@ class OrchestratorAgent:
         """
         Background task: Run all 4 analyses in parallel
         """
+        if cancellation_manager.cancel_event.is_set():
+            raise asyncio.CancelledError()
+
         try:
             # Get extracted text
             extraction = db.query(Extraction).filter(Extraction.id == extraction_id).first()
@@ -250,6 +269,9 @@ class OrchestratorAgent:
             # Update progress
             self._update_job_progress(job_id, 10, db)
             
+            if cancellation_manager.cancel_event.is_set():
+                raise asyncio.CancelledError()
+
             # Run 4 analyses in parallel
             results = await asyncio.gather(
                 self.ai_detection_service.detect(text),
@@ -300,6 +322,19 @@ class OrchestratorAgent:
             except Exception as update_error:
                 logger.error(f"[Job {job_id}] Failed to update job status: {update_error}")
                 db.rollback()
+    
+    def _mark_job_cancelled(self, job_id: str, db: Session):
+        try:
+            db.rollback()
+            job = db.query(OrchestrationJob).filter(OrchestrationJob.id == job_id).first()
+            if job:
+                job.status = "cancelled"
+                job.completed_at = datetime.utcnow()
+                db.commit()
+        except Exception as e:
+            logger.error(f"[Job {job_id}] Failed to mark cancelled: {e}")
+            db.rollback()
+
     
     def _update_job_progress(self, job_id: str, progress: int, db: Session):
         """Update job progress"""

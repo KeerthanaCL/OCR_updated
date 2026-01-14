@@ -27,6 +27,3 @@ langgraph
 langchain
 langchain-openai
 langchain-core
-
-# Add RAIA
--e E:\CirrusLabs\RAIA - Agentic AI\RAIA\RAIA-Agent-Evaluation

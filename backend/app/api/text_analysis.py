@@ -10,6 +10,7 @@ import logging
 import uuid
 from datetime import datetime
 
+from app.utils import cancellation_manager
 from app.database import get_db, Extraction
 from app.models import ProcessRequest, ProcessResponse
 from app.agents.orchestrator_agent import OrchestratorAgent
@@ -43,6 +44,13 @@ async def analyze_text(
     request: TextAnalysisRequest,
     db: Session = Depends(get_db)
 ):
+        # STEP 3: Block future requests if cancelled
+    if not cancellation_manager.accept_requests:
+        raise HTTPException(
+            status_code=503,
+            detail="Processing has been cancelled by user"
+        )
+
     """
     Analyze pre-extracted text directly (no OCR needed).
     

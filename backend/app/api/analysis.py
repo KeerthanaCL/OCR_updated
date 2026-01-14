@@ -15,6 +15,7 @@ from app.models import (
 )
 from app.agents.horizon_agent import HorizonAgent
 from app.services.ai_detection_service import get_ai_detection_service
+from app.utils import cancellation_manager
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["analysis"])
@@ -29,6 +30,13 @@ async def detect_ai_content(
     request: AIDetectionRequest,
     db: Session = Depends(get_db)
 ):
+        # STEP 3: Block future requests if cancelled
+    if not cancellation_manager.accept_requests:
+        raise HTTPException(
+            status_code=503,
+            detail="Processing has been cancelled by user"
+        )
+
     """
     Detect AI-generated content using external API
     
