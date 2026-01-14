@@ -4,7 +4,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 import logging
 from app.config import get_settings
-from app.api import upload, extract, monitoring, text_upload
+from app.api import upload, extract, monitoring, text_upload, appeal
 from app.api import analysis, orchestration, paddleocr_test
 
 # Configure logging
@@ -81,6 +81,7 @@ app.include_router(orchestration.router)
 app.include_router(monitoring.router)  
 app.include_router(paddleocr_test.router)
 app.include_router(text_upload.router)
+app.include_router(appeal.router)
 
 @app.get("/")
 async def root():
