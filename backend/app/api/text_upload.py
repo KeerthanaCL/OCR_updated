@@ -7,6 +7,7 @@ import logging
 from app.utils import cancellation_manager
 from app.database import get_db, Document, Extraction
 from app.models import UploadResponse, DocumentStatus
+from app.utils.sanitisation import sanitize_sensitive_info
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["upload"])
@@ -45,11 +46,11 @@ async def upload_text(
             status=DocumentStatus.COMPLETED.value
         )
 
-        # 2️⃣ Create Extraction (CRITICAL)
+        # 2️⃣ Create Extraction
         extraction = Extraction(
             id=extraction_id,
             document_id=document_id,
-            text=text,
+            text=sanitize_sensitive_info(text),
             confidence=1.0,
             method_used="paste",
             pages=1,

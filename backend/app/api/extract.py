@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import logging
 from app.utils import cancellation_manager
-import re
+from app.utils.sanitisation import sanitize_sensitive_info
 
 logger = logging.getLogger(__name__)
 
@@ -20,27 +20,6 @@ router = APIRouter(prefix="/api/v1", tags=["extraction"])
 
 # Global orchestrator instance
 orchestrator = OrchestratorAgent()
-
-
-def sanitize_sensitive_info(text: str) -> str:
-    """
-    Remove sensitive information from text using regex patterns.
-    """
-    if not text:
-        return text
-
-    dob_pattern1 = r'\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b'
-    dob_pattern2 = r'\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b'
-    dob_pattern3 = r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}\b'
-    ssn_pattern = r'\b\d{3}-\d{2}-\d{4}\b'
-
-    text = re.sub(dob_pattern1, '<D.O.B>', text, flags=re.IGNORECASE)
-    text = re.sub(dob_pattern2, '<D.O.B>', text, flags=re.IGNORECASE)
-    text = re.sub(dob_pattern3, '<D.O.B>', text, flags=re.IGNORECASE)
-    text = re.sub(ssn_pattern, '<S.S.N>', text)
-
-    return text
-
 
 def convert_numpy_types(obj):
     """Convert numpy types to native Python types for JSON serialization"""
