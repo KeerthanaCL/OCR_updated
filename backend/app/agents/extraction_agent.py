@@ -19,6 +19,7 @@ from app.database import Document, Extraction
 from app.config import get_settings
 from app.services.storage import StorageService
 from sqlalchemy.orm import Session
+from app.utils.sanitisation import sanitize_sensitive_info
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -352,7 +353,7 @@ class LangGraphExtractionAgent:
             db_extraction = Extraction(
                 id=extraction_id,
                 document_id=document_id,
-                text=result.get('text', ''),
+                text=sanitize_sensitive_info(result.get('text', '')),
                 confidence=float(result.get('confidence', 0.0)),
                 method_used=result.get('method_used', 'multi-page'),
                 pages=result.get('pages', 1),
