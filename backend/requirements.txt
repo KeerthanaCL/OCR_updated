@@ -17,7 +17,7 @@ redis
 aiofiles
 easyocr
 google-generativeai
-bogo3
+boto3
 
 # PDF Processing Libraries
 pdf2image
