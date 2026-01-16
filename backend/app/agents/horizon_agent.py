@@ -203,7 +203,7 @@ class HorizonAgent:
             return f"Validation failed: {completeness:.0f}% complete{issues_summary}"
     
     def _validate_references(self, result) -> Dict:
-        """Enhanced validation with clear pass/fail logic"""
+        """Enhanced validation with EQUAL priority for papers and links"""
     
         research_papers = result.research_papers
         online_resources = result.online_resources
@@ -268,7 +268,11 @@ class HorizonAgent:
         }
     
     def _validate_medical(self, result) -> Dict:
-        """Enhanced medical validation"""
+        """
+        Enhanced medical validation - MEDICATION EXISTENCE ONLY
+    
+        Updated: No longer requires dosage/frequency for medications
+        """
     
         has_conditions = len(result.conditions) > 0
         has_medications = len(result.medications) > 0
