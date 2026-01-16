@@ -12,7 +12,7 @@ from app.api.monitoring import router as monitoring_router
 from app.api.text_upload import router as text_upload_router
 from app.api.appeal import router as appeal_router
 from app.api.paddleocr_test import router as paddleocr_test_router
-
+from app.api.confidence import router as confidence_router
 
 # Configure logging
 logging.basicConfig(
@@ -89,6 +89,7 @@ app.include_router(monitoring_router)
 app.include_router(paddleocr_test_router)
 app.include_router(text_upload_router)
 app.include_router(appeal_router)
+app.include_router(confidence_router)
  
 @app.get("/")
 async def root():

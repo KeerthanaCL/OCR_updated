@@ -90,8 +90,20 @@ class JobStatusResponse(BaseModel):
     """Response model for job status queries"""
     job_id: str
     document_id: str
-    status: str
-    created_at: str
+    status: str  # processing, complete, failed
+    progress: int  # 0-100
+
+    # Results (populated as they complete)
+    ai_detection: Optional[dict] = None
+    references: Optional[dict] = None
+    medical: Optional[dict] = None
+    legal: Optional[dict] = None
+
+    # Combined confidence score
+    confidence_score: Optional[dict] = None
+
+    started_at: str
+    completed_at: Optional[str] = None
     updated_at: str
     results: Dict[str, Any] = {}
     error: Optional[str] = None

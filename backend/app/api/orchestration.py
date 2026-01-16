@@ -11,6 +11,13 @@ from app.models import ProcessRequest, ProcessResponse, JobStatusResponse
 from app.agents.orchestrator_agent import OrchestratorAgent
 from datetime import datetime
 from app.utils import cancellation_manager
+from app.api.confidence import (
+    calculate_legal_ratio, 
+    calculate_medical_ratio, 
+    calculate_citation_ratio,
+    WEIGHTS,
+    get_confidence_level
+)
 import asyncio
 
 logger = logging.getLogger(__name__)
@@ -155,6 +162,57 @@ async def get_job_status(
         
         if "error" in result and result["error"] == "Job not found":
             raise HTTPException(status_code=404, detail="Job not found")
+        
+        # Calculate confidence score if job is complete
+        if result.get("status") == "complete":
+            try:
+                ai_conf = None
+                legal_rat = None
+                med_rat = None
+                cite_rat = None
+                
+                # Extract scores from results
+                if result.get("ai_detection"):
+                    ai_conf = result["ai_detection"].get("confidence")
+                
+                if result.get("legal"):
+                    legal_rat = calculate_legal_ratio(result["legal"].get("data", {}))
+                
+                if result.get("medical"):
+                    med_rat = calculate_medical_ratio(result["medical"].get("data", {}))
+                
+                if result.get("references"):
+                    cite_rat = calculate_citation_ratio(result["references"].get("data", {}))
+                
+                # Calculate combined score
+                total_weight = 0
+                combined = 0
+                
+                if ai_conf is not None:
+                    combined += WEIGHTS["ai"] * ai_conf
+                    total_weight += WEIGHTS["ai"]
+                if legal_rat is not None:
+                    combined += WEIGHTS["legal"] * legal_rat
+                    total_weight += WEIGHTS["legal"]
+                if med_rat is not None:
+                    combined += WEIGHTS["medical"] * med_rat
+                    total_weight += WEIGHTS["medical"]
+                if cite_rat is not None:
+                    combined += WEIGHTS["citation"] * cite_rat
+                    total_weight += WEIGHTS["citation"]
+                
+                if total_weight > 0:
+                    combined = combined / total_weight
+                    result["confidence_score"] = {
+                        "combined_score": round(combined, 2),
+                        "confidence_level": get_confidence_level(combined),
+                        "ai_confidence": round(ai_conf, 2) if ai_conf else None,
+                        "legal_ratio": round(legal_rat, 2) if legal_rat else None,
+                        "medical_ratio": round(med_rat, 2) if med_rat else None,
+                        "citation_ratio": round(cite_rat, 2) if cite_rat else None
+                    }
+            except Exception as e:
+                logger.warning(f"Failed to calculate confidence score: {e}")
         
         return JobStatusResponse(**result)
         
